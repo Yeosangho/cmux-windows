@@ -37,6 +37,22 @@ public class TerminalControl : FrameworkElement
     private bool _followOutput = true;
     private int _lastScrollbackCount;
     private int _renderQueued;
+
+    // Visibility-aware render gating. When the workspace this control belongs
+    // to is not currently shown (e.g., the user switched to another workspace
+    // and a different SurfaceView is in the ContentControl), this control's
+    // session keeps streaming output and firing Redraw. Without gating, every
+    // chunk becomes a Dispatcher.BeginInvoke that competes with the visible
+    // workspace's renders and IME message processing — that's the cross-
+    // workspace lag and Korean-IME breakage the user observed.
+    //
+    // _isVisibleSnapshot mirrors IsVisible (UI thread-only DepProp) so the
+    // PTY read thread can check it without crossing threads. When we hit a
+    // RequestRender while hidden we just remember a render is owed; flipping
+    // back to visible flushes one catch-up render.
+    private volatile bool _isVisibleSnapshot;
+    private int _renderPendingWhileHidden;
+
     private string _cursorStyle = "bar";
     private bool _cursorBlink = true;
 
@@ -194,6 +210,9 @@ public class TerminalControl : FrameworkElement
         InputMethod.SetIsInputMethodEnabled(this, true);
 
         _selection.SelectionChanged += () => RequestRender(System.Windows.Threading.DispatcherPriority.Render);
+
+        _isVisibleSnapshot = IsVisible;
+        IsVisibleChanged += OnIsVisibleChanged;
 
         // Cursor blink
         _cursorTimer = new System.Windows.Threading.DispatcherTimer
@@ -372,6 +391,16 @@ public class TerminalControl : FrameworkElement
         if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
             return;
 
+        if (!_isVisibleSnapshot)
+        {
+            // Belongs to a workspace not currently on screen. Skip the
+            // dispatcher round-trip — buffer state is already up to date in
+            // TerminalSession.Buffer; we'll catch up with a single render
+            // when this control becomes visible again.
+            Interlocked.Exchange(ref _renderPendingWhileHidden, 1);
+            return;
+        }
+
         if (Interlocked.Exchange(ref _renderQueued, 1) == 1)
             return;
 
@@ -380,6 +409,20 @@ public class TerminalControl : FrameworkElement
             Interlocked.Exchange(ref _renderQueued, 0);
             Render();
         }, priority);
+    }
+
+    private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        var nowVisible = e.NewValue is bool b && b;
+        _isVisibleSnapshot = nowVisible;
+
+        if (nowVisible && Interlocked.Exchange(ref _renderPendingWhileHidden, 0) == 1)
+        {
+            // Catch up — buffer may have advanced significantly while hidden.
+            if (_session != null)
+                _lastScrollbackCount = _session.Buffer.ScrollbackCount;
+            RequestRender(System.Windows.Threading.DispatcherPriority.Render);
+        }
     }
 
     // --- Layout ---
@@ -1084,8 +1127,11 @@ public class TerminalControl : FrameworkElement
         {
             if (e.Key == Key.Back)
                 TrackInputText("\b");
-            else if (e.Key == Key.Enter)
+            else if (e.Key == Key.Enter && !modifiers.HasFlag(ModifierKeys.Shift))
             {
+                // Plain Enter submits — track for command history / interception.
+                // Shift+Enter is a newline-within-input (multi-line agent prompt)
+                // and must not trigger command submission.
                 SubmitBufferedCommand(allowInterception: true);
                 if (_suppressNextEnterToShell)
                 {
@@ -1769,7 +1815,10 @@ public class TerminalControl : FrameworkElement
 
         return key switch
         {
-            Key.Enter => "\r",
+            // Shift+Enter sends ESC+CR (alacritty / wezterm convention) so
+            // multi-line agent CLIs like Claude Code can distinguish it from
+            // a plain Enter (which submits). Bare Enter still sends CR.
+            Key.Enter => modifiers.HasFlag(ModifierKeys.Shift) ? "\x1b\r" : "\r",
             Key.Escape => "\x1b",
             Key.Back => "\x7f",
             Key.Tab => modifiers.HasFlag(ModifierKeys.Shift) ? "\x1b[Z" : "\t",

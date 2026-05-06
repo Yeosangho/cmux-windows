@@ -24,6 +24,18 @@ public sealed class TerminalSession : IDisposable
     private volatile bool _localWriteNullLogged;
     private readonly object _lock = new();
 
+    // Redraw coalescing. Without this, every PTY chunk fires Redraw → BeginInvoke
+    // → render bookkeeping on the WPF UI thread. Burst output across multiple
+    // workspaces saturates the dispatcher and causes WM_IME_COMPOSITION drops
+    // (Korean composition gets committed as raw Latin keys). We allow the
+    // leading edge to fire immediately so latency stays low, then throttle
+    // subsequent fires to ~60 Hz with a trailing-edge timer so the final frame
+    // of a burst is always rendered.
+    private static readonly long RedrawIntervalTicks = Stopwatch.Frequency / 60;
+    private long _lastRedrawTicks;
+    private int _redrawTimerArmed;
+    private System.Threading.Timer? _redrawTimer;
+
     public TerminalBuffer Buffer { get; }
     public string PaneId { get; }
     public string? Title { get; private set; }
@@ -212,7 +224,7 @@ public sealed class TerminalSession : IDisposable
 
                 RawOutputReceived?.Invoke(chunk);
                 OutputReceived?.Invoke();
-                Redraw?.Invoke();
+                ScheduleRedraw();
             }
         }
         catch (IOException) when (_disposed)
@@ -319,6 +331,47 @@ public sealed class TerminalSession : IDisposable
         }
 
         OutputReceived?.Invoke();
+        ScheduleRedraw();
+    }
+
+    private void ScheduleRedraw()
+    {
+        if (_disposed) return;
+
+        var now = Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref _lastRedrawTicks);
+        if (now - last >= RedrawIntervalTicks)
+        {
+            Interlocked.Exchange(ref _lastRedrawTicks, now);
+            Redraw?.Invoke();
+            return;
+        }
+
+        // Inside the throttle window. Arm a one-shot timer so the trailing
+        // chunk of a burst is rendered, but only once until it fires.
+        if (Interlocked.Exchange(ref _redrawTimerArmed, 1) != 0)
+            return;
+
+        var dueTicks = RedrawIntervalTicks - (now - last);
+        var dueMs = (int)(dueTicks * 1000L / Stopwatch.Frequency);
+        if (dueMs < 1) dueMs = 1;
+
+        _redrawTimer ??= new System.Threading.Timer(OnRedrawTimer, null, Timeout.Infinite, Timeout.Infinite);
+        try
+        {
+            _redrawTimer.Change(dueMs, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException)
+        {
+            Interlocked.Exchange(ref _redrawTimerArmed, 0);
+        }
+    }
+
+    private void OnRedrawTimer(object? state)
+    {
+        Interlocked.Exchange(ref _redrawTimerArmed, 0);
+        if (_disposed) return;
+        Interlocked.Exchange(ref _lastRedrawTicks, Stopwatch.GetTimestamp());
         Redraw?.Invoke();
     }
 
@@ -640,6 +693,7 @@ public sealed class TerminalSession : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        _redrawTimer?.Dispose();
         _readStream?.Dispose();
         _writeStream?.Dispose();
         _process?.Dispose();

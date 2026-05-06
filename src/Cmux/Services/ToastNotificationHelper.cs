@@ -1,4 +1,3 @@
-using System.IO;
 using Cmux.Core.Models;
 using Microsoft.Toolkit.Uwp.Notifications;
 
@@ -33,19 +32,6 @@ public static class ToastNotificationHelper
                 .AddAudio(new System.Uri("ms-winsoundevent:Notification.Default"));
             if (!string.IsNullOrEmpty(notification.PaneId))
                 builder.AddArgument("paneId", notification.PaneId);
-
-            // Diagnostic — append the body we hand to the toolkit so we can
-            // compare emitted vs displayed if a bug reappears.
-            try
-            {
-                var logPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "cmuxw-toast.log");
-                File.AppendAllText(logPath,
-                    $"[{DateTime.Now:HH:mm:ss.fff}] ShowToast id={notification.Id} title='{notification.Title}' body='{notification.Body}'\n",
-                    System.Text.Encoding.UTF8);
-            }
-            catch { }
 
             builder.Show();
         }
