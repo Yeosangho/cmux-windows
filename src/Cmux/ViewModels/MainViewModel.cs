@@ -38,7 +38,7 @@ public partial class MainViewModel : ObservableObject
     private int _totalUnreadCount;
 
     [ObservableProperty]
-    private bool _agentPanelVisible = true;
+    private bool _agentPanelVisible;
 
     [ObservableProperty]
     private double _agentPanelWidth = 380;
