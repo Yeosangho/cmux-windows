@@ -2,6 +2,44 @@
 
 A dark, keyboard-first terminal multiplexer for Windows, inspired by tmux/cmux workflows but built natively with WPF + ConPTY.
 
+> **Forked from** https://github.com/mkurman/cmux-windows
+
+---
+
+## Fork에서 추가/개선된 기능 (한국어)
+
+원본 [mkurman/cmux-windows](https://github.com/mkurman/cmux-windows) 대비 다음 기능이 추가되거나 개선되었습니다.
+
+### 1. 한국어 / CJK 입출력 정상화
+- **East Asian Width 기반 셀 폭 계산** — CJK 글자가 2셀 폭으로 올바르게 그려져 글자 겹침 / 띄어쓰기 깨짐 해소 (`Cmux.Core/Terminal/UnicodeWidth.cs` 신설, `TerminalBuffer`의 wide cell + continuation cell 처리)
+- **한글 IME 조합 정상화** — WPF `TextBox`를 숨김 IME 프록시로 두고 `TerminalControl`은 순수 렌더만 담당. 조합 중 글자는 preedit 오버레이로 표시. `TextBox.Text`를 절대 건드리지 않아 TSF 상태 보존 ("안녕" → "아ㄴ녀ㅇ" 같은 자모 분리 증상 제거)
+- **OSC 알림 본문 UTF-8 정상 디코드** — `VtParser`가 OSC 페이로드를 byte 버퍼로 누적 후 dispatch 시점 일괄 UTF-8 디코드
+- **OSC 0x9C ↔ UTF-8 충돌 수정** — "시"(EC 8B 9C) 같이 0x9C를 포함한 문자가 ST 종료자로 오인되어 알림이 "메�"로 잘리던 문제 수정
+
+### 2. 알림 시스템 강화
+- **OSC 99 sender id / timestamp 키 지원** (`i=`, `ts=`) — hook이 동일 알림을 중복 발사해도 dedup 키로 중복 제거
+- **알림 사운드** (`winmm.dll` `PlaySound`) — toast 외에 인앱 사운드도 함께 재생
+- **알림 로컬 시각 표시** — sender 타임스탬프를 받아 로컬 TZ로 환산해 패널 / toast에 노출
+- **단일 인스턴스 toast forwarding** — toast 클릭으로 새 cmux 프로세스가 기동되더라도 기존 인스턴스로 인자가 전달되어 중복 실행 방지
+- **NotificationPanel 클릭 → 해당 패널 점프** (`NotificationClicked` 이벤트 + `MainViewModel.NavigateToNotification`)
+
+> **Claude Code 연동 설정 방법은 [`cmux-claude-code/README.md`](cmux-claude-code/README.md) 참고.**
+> `~/.claude/settings.json`의 `hooks` 블록과 OSC 99 페이로드를 PTS로 송신하는 `notify.sh` 예시,
+> 등록 이벤트(`Stop` / `PreToolUse` / `Elicitation`)별 발화 시점, 진단 로그(`/tmp/claude-notify.log`) 활용법까지 포함되어 있습니다.
+
+### 3. 활성 패널 시각화
+- 키보드 입력이 전달되는 패널에 **2px 파란색(`#3B82F6`) 외곽선** 표시
+- Border를 패널별 캐시 (`_paneBorderCache`) 해 포커스 변화 시 색만 즉시 교체 — 리빌드 / 레이아웃 시프트 없음
+- 새 테마 리소스: `FocusedPaneBorderColor`, `FocusedPaneBorderBrush`
+
+### 4. 레이아웃 / 세션 안정화
+- **레이아웃 변경 시 세션 파괴 안 됨** — `SurfaceViewModel.ApplyLayoutTree`가 기존 패널 ID를 비파괴적으로 재매핑
+- **세션 복원 시 자동 Enter 입력 제거** — 재시작 후 "이전 세션의 다음 추천 메시지가 그냥 실행되던" 증상 해소
+- **레이아웃 변경 후 한국어 입력 안 되던 문제** — `Focus()` → `Keyboard.Focus(imeProxy)` 2-stage focus dance + `InputMethod.SetIsInputMethodEnabled` 재assert로 IME 컨텍스트 재바인딩
+
+### 회귀 테스트
+- `tests/Cmux.Tests/CoreTests.cs`에 OSC 0x9C UTF-8 충돌, 알림 dedup, OSC 99 sender id/timestamp 파싱 등 회귀 테스트 추가
+
 ---
 
 ## Why / Who / What / How

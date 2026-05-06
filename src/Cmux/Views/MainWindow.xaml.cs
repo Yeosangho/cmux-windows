@@ -13,6 +13,8 @@ using Cmux.Controls;
 using Cmux.Core.Services;
 using Cmux.ViewModels;
 using Cmux.Services;
+using SplitNode = Cmux.Core.Models.SplitNode;
+using SplitDirection = Cmux.Core.Models.SplitDirection;
 
 namespace Cmux.Views;
 
@@ -35,6 +37,7 @@ public partial class MainWindow : Window
         SetupWorkspaceFilter();
 
         CommandPaletteControl.PaletteClosed += () => FocusTerminal();
+        NotificationPanelControl.NotificationClicked += n => ViewModel.NavigateToNotification(n);
         CommandPaletteControl.ItemExecuted += item => FocusTerminal();
 
 
@@ -1122,28 +1125,10 @@ public partial class MainWindow : Window
         var surface = ViewModel.SelectedWorkspace?.SelectedSurface;
         if (surface == null) return;
 
-        NormalizeToSinglePane(surface);
-
-        for (int c = 1; c < cols; c++)
-            surface.SplitRight();
-
-        if (rows > 1)
-        {
-            var columnPaneIds = surface.RootNode.GetLeaves()
-                .Select(l => l.PaneId)
-                .Where(id => !string.IsNullOrWhiteSpace(id))
-                .Cast<string>()
-                .ToList();
-
-            foreach (var paneId in columnPaneIds)
-            {
-                surface.FocusPane(paneId);
-                for (int r = 1; r < rows; r++)
-                    surface.SplitDown();
-            }
-        }
-
-        surface.EqualizePanes();
+        // Build the target geometry as a fresh SplitNode tree, then let the
+        // surface remap its existing pane IDs into it. This is non-destructive
+        // — running Claude / SSH / etc. sessions survive layout changes.
+        surface.ApplyLayoutTree(BuildLayoutTree(cols, rows));
     }
 
     private void ApplyMainStackLayout()
@@ -1151,43 +1136,42 @@ public partial class MainWindow : Window
         var surface = ViewModel.SelectedWorkspace?.SelectedSurface;
         if (surface == null) return;
 
-        NormalizeToSinglePane(surface);
-
-        // Main pane on left, stack of 2 on right
-        surface.SplitRight();
-
-        var rightPaneId = surface.RootNode.GetLeaves()
-            .Skip(1)
-            .Select(l => l.PaneId)
-            .FirstOrDefault(id => !string.IsNullOrWhiteSpace(id));
-
-        if (!string.IsNullOrWhiteSpace(rightPaneId))
-        {
-            surface.FocusPane(rightPaneId);
-            surface.SplitDown();
-            surface.EqualizePanes();
-        }
+        surface.ApplyLayoutTree(SplitNode.CreateMainStack(2));
     }
 
-    private static void NormalizeToSinglePane(SurfaceViewModel surface)
+    /// <summary>Builds a cols × rows layout tree (each column stacks `rows` panes).</summary>
+    private static SplitNode BuildLayoutTree(int cols, int rows)
     {
-        var paneIds = surface.RootNode.GetLeaves()
-            .Select(l => l.PaneId)
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .Cast<string>()
-            .ToList();
+        cols = Math.Max(1, cols);
+        rows = Math.Max(1, rows);
 
-        if (paneIds.Count <= 1) return;
+        if (cols == 1 && rows == 1) return SplitNode.CreateLeaf();
+        if (rows == 1) return SplitNode.CreateColumns(cols);
+        if (cols == 1) return SplitNode.CreateRows(rows);
+        if (cols == 2 && rows == 2) return SplitNode.CreateGrid();
 
-        var focusedPaneId = surface.FocusedPaneId;
-        string keepPaneId = !string.IsNullOrWhiteSpace(focusedPaneId) && paneIds.Contains(focusedPaneId)
-            ? focusedPaneId
-            : paneIds[0];
-
-        surface.FocusPane(keepPaneId);
-
-        foreach (var paneId in paneIds.Where(id => id != keepPaneId))
-            surface.ClosePane(paneId);
+        // General N×M: stack `rows` rows per column, then join columns left→right.
+        SplitNode? root = null;
+        for (int c = 0; c < cols; c++)
+        {
+            var column = SplitNode.CreateRows(rows);
+            if (root == null)
+            {
+                root = column;
+            }
+            else
+            {
+                root = new SplitNode
+                {
+                    IsLeaf = false,
+                    Direction = SplitDirection.Vertical,
+                    SplitRatio = (double)c / (c + 1),
+                    First = root,
+                    Second = column,
+                };
+            }
+        }
+        return root!;
     }
 
     private void FocusTerminal()

@@ -19,7 +19,25 @@ public class NotificationService
     public event Action? UnreadCountChanged;
 
     /// <summary>
+    /// Marshal callback used to dispatch ObservableCollection mutations and
+    /// event firing onto the UI thread. PTY output (which generates OSC
+    /// notifications) is processed on a background thread, and a ListBox
+    /// bound to <see cref="Notifications"/> throws ItemContainerGenerator
+    /// "Verify" errors when items are inserted from the wrong thread.
+    /// App.xaml.cs sets this to a Dispatcher.BeginInvoke wrapper at startup.
+    /// </summary>
+    public Action<Action>? UIMarshal { get; set; }
+
+    /// <summary>
     /// Adds a new notification.
+    /// <para>
+    /// <paramref name="senderId"/> and <paramref name="senderTimestamp"/> come
+    /// from the OSC 99 <c>i=</c> / <c>ts=</c> fields when the source uses
+    /// them. <paramref name="senderId"/> is composed with <paramref name="paneId"/>
+    /// to scope deduplication: the same id retransmitted from the same pane
+    /// is dropped (so hooks can resend without spamming), while the same id
+    /// from a different pane is treated as a separate notification.
+    /// </para>
     /// </summary>
     public void AddNotification(
         string workspaceId,
@@ -28,31 +46,56 @@ public class NotificationService
         string title,
         string? subtitle,
         string body,
-        NotificationSource source)
+        NotificationSource source,
+        string? senderId = null,
+        DateTime? senderTimestamp = null)
     {
-        var notification = new TerminalNotification
-        {
-            WorkspaceId = workspaceId,
-            SurfaceId = surfaceId,
-            PaneId = paneId,
-            Title = title,
-            Subtitle = subtitle,
-            Body = body,
-            Source = source,
-            IsRead = false,
-        };
+        // Composite dedup key: pane + sender id. Without paneId scoping, two
+        // panes legitimately emitting the same id (e.g. an `Stop` hook that
+        // uses `$$` PID — process ids reset per-shell) would clobber each other.
+        string? dedupKey = senderId == null
+            ? null
+            : $"{paneId ?? string.Empty}\0{senderId}";
 
+        TerminalNotification notification;
         lock (_lock)
         {
-            _notifications.Insert(0, notification);
+            if (dedupKey != null && _notifications.Any(n => n.DedupKey == dedupKey))
+                return;
 
-            // Keep max 500 notifications
-            while (_notifications.Count > 500)
-                _notifications.RemoveAt(_notifications.Count - 1);
+            notification = new TerminalNotification
+            {
+                WorkspaceId = workspaceId,
+                SurfaceId = surfaceId,
+                PaneId = paneId,
+                Title = title,
+                Subtitle = subtitle,
+                Body = body,
+                Source = source,
+                IsRead = false,
+                Timestamp = senderTimestamp ?? DateTime.UtcNow,
+                DedupKey = dedupKey,
+            };
         }
 
-        NotificationAdded?.Invoke(notification);
-        UnreadCountChanged?.Invoke();
+        // Apply mutation + events on the UI thread when a marshal callback is
+        // wired up. Otherwise WPF's ListBox.ItemContainerGenerator throws
+        // cross-thread Verify errors the second time PTY-driven notifications
+        // arrive while the panel is showing earlier items.
+        void Apply()
+        {
+            lock (_lock)
+            {
+                _notifications.Insert(0, notification);
+                while (_notifications.Count > 500)
+                    _notifications.RemoveAt(_notifications.Count - 1);
+            }
+            NotificationAdded?.Invoke(notification);
+            UnreadCountChanged?.Invoke();
+        }
+
+        if (UIMarshal != null) UIMarshal(Apply);
+        else Apply();
     }
 
     /// <summary>

@@ -1,0 +1,35 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "AskUserQuestion|ExitPlanMode",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/root/.claude/notify.sh \"질문 대기\""
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/root/.claude/notify.sh \"응답 완료\""
+        }
+      ]
+    }
+  ],
+  "Elicitation": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/root/.claude/notify.sh \"입력 요청\""
+        }
+      ]
+    }
+  ]
+}

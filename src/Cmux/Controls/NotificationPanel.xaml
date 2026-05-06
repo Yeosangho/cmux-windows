@@ -53,7 +53,9 @@
                 <ListBox.ItemTemplate>
                     <DataTemplate>
                         <Border Padding="16,10" BorderBrush="{StaticResource BorderBrush}"
-                                BorderThickness="0,0,0,1">
+                                BorderThickness="0,0,0,1" Cursor="Hand"
+                                Background="Transparent"
+                                MouseLeftButtonUp="NotificationItem_Click">
                             <Grid>
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto" />
@@ -90,8 +92,8 @@
                                            TextTrimming="CharacterEllipsis"
                                            LineHeight="16" />
 
-                                <!-- Timestamp -->
-                                <TextBlock Grid.Row="2" Text="{Binding Timestamp, StringFormat=HH:mm:ss}"
+                                <!-- Timestamp (local timezone, e.g. KST for Korean users) -->
+                                <TextBlock Grid.Row="2" Text="{Binding LocalTimestamp, StringFormat=HH:mm:ss}"
                                            Foreground="{StaticResource ForegroundDimBrush}"
                                            FontSize="10" Margin="0,4,0,0" Opacity="0.6" />
                             </Grid>

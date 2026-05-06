@@ -9,7 +9,11 @@ public class OscHandler
 {
     public event Action<string>? TitleChanged;
     public event Action<string>? WorkingDirectoryChanged;
-    public event Action<string, string?, string>? NotificationReceived; // title, subtitle, body
+    // title, subtitle, body, id?, timestamp?
+    // id and timestamp are non-null only when the sender supplied them via
+    // OSC 99's i= / ts= keys. NotificationService uses them for dedup and to
+    // record the actual emission time instead of arrival time.
+    public event Action<string, string?, string, string?, DateTime?>? NotificationReceived;
     public event Action<char, string?>? ShellPromptMarker;
 
     /// <summary>
@@ -52,7 +56,7 @@ public class OscHandler
             case 9: // Terminal notification (body text)
                 // OSC 9 ; <body> ST
                 // Used by many terminal emulators for simple notifications
-                NotificationReceived?.Invoke("Terminal", null, payload);
+                NotificationReceived?.Invoke("Terminal", null, payload, null, null);
                 break;
 
             case 99: // Extended notification (key=value pairs)
@@ -115,17 +119,23 @@ public class OscHandler
     /// <summary>
     /// OSC 99: Extended notification format.
     /// Format: key=value;key=value
-    /// Keys: i (id), d (icon), t (title), b (body), p (progress)
-    /// Some implementations use: OSC 99 ; title ; body
+    /// Keys:
+    ///   t  = title
+    ///   b  = body
+    ///   s  = subtitle
+    ///   i  = sender-supplied ID (dedup key — duplicates dropped by NotificationService)
+    ///   ts = Unix epoch seconds (sender-supplied timestamp)
+    /// Falls back to "OSC 99 ; body" simple form when no '=' is present.
     /// </summary>
     private void HandleOsc99(string payload)
     {
-        // Try key=value format first
         if (payload.Contains('='))
         {
             string? title = null;
             string? body = null;
             string? subtitle = null;
+            string? id = null;
+            DateTime? timestamp = null;
 
             foreach (var pair in payload.Split(';'))
             {
@@ -139,6 +149,11 @@ public class OscHandler
                     case "t": title = value; break;
                     case "b": body = value; break;
                     case "s": subtitle = value; break;
+                    case "i": id = string.IsNullOrEmpty(value) ? null : value; break;
+                    case "ts":
+                        if (long.TryParse(value, out var epoch))
+                            timestamp = DateTimeOffset.FromUnixTimeSeconds(epoch).UtcDateTime;
+                        break;
                 }
             }
 
@@ -147,13 +162,15 @@ public class OscHandler
                 NotificationReceived?.Invoke(
                     title ?? "Terminal",
                     subtitle,
-                    body ?? title ?? "");
+                    body ?? title ?? "",
+                    id,
+                    timestamp);
             }
         }
         else
         {
             // Simpler format: OSC 99 ; body
-            NotificationReceived?.Invoke("Terminal", null, payload);
+            NotificationReceived?.Invoke("Terminal", null, payload, null, null);
         }
     }
 
@@ -168,11 +185,11 @@ public class OscHandler
         {
             string title = parts.Length >= 2 ? parts[1] : "Terminal";
             string body = parts.Length >= 3 ? parts[2] : "";
-            NotificationReceived?.Invoke(title, null, body);
+            NotificationReceived?.Invoke(title, null, body, null, null);
         }
         else
         {
-            NotificationReceived?.Invoke("Terminal", null, payload);
+            NotificationReceived?.Invoke("Terminal", null, payload, null, null);
         }
     }
 }

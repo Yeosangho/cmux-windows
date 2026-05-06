@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using Cmux.Core.Models;
 using Cmux.Core.Config;
@@ -17,14 +18,18 @@ public class SplitPaneContainer : ContentControl
 {
     private SurfaceViewModel? _surface;
     private readonly Dictionary<string, TerminalControl> _terminalCache = [];
+    // One TextBox proxy per pane, paired with the TerminalControl. Cached so
+    // its IME composition state and event subscriptions persist across
+    // tree rebuilds (layout change / zoom toggle).
+    private readonly Dictionary<string, TextBox> _imeProxyCache = [];
+    // Outer Border per pane — cached so UpdateFocusState can repaint the
+    // active-pane outline without rebuilding the whole subtree.
+    private readonly Dictionary<string, Border> _paneBorderCache = [];
 
     public event Action? SearchRequested;
 
     private static SolidColorBrush GetThemeBrush(string key) =>
         Application.Current.Resources[key] as SolidColorBrush ?? Brushes.Transparent;
-
-    private static Color GetThemeColor(string key) =>
-        Application.Current.Resources[key] is Color c ? c : Colors.Transparent;
 
     public SplitPaneContainer()
     {
@@ -42,6 +47,8 @@ public class SplitPaneContainer : ContentControl
         // Clear terminal cache when switching surfaces/workspaces
         // This prevents reusing terminals from a different workspace
         _terminalCache.Clear();
+        _imeProxyCache.Clear();
+        _paneBorderCache.Clear();
 
         _surface = e.NewValue as SurfaceViewModel;
 
@@ -86,7 +93,14 @@ public class SplitPaneContainer : ContentControl
 
         foreach (var (paneId, terminal) in _terminalCache)
         {
-            terminal.IsPaneFocused = paneId == _surface.FocusedPaneId;
+            var focused = paneId == _surface.FocusedPaneId;
+            terminal.IsPaneFocused = focused;
+            if (_paneBorderCache.TryGetValue(paneId, out var border))
+            {
+                border.BorderBrush = focused
+                    ? GetThemeBrush("FocusedPaneBorderBrush")
+                    : GetThemeBrush("BorderBrush");
+            }
         }
     }
 
@@ -101,11 +115,56 @@ public class SplitPaneContainer : ContentControl
             if (focusedNode != null)
             {
                 Content = BuildLeaf(focusedNode);
+                RestoreKeyboardFocusToFocusedPane();
                 return;
             }
         }
 
         Content = BuildNode(_surface.RootNode);
+        RestoreKeyboardFocusToFocusedPane();
+    }
+
+    /// <summary>
+    /// After a tree rebuild (e.g. layout change), the previously-focused
+    /// TerminalControl is reused but its visual parent has been replaced, so
+    /// WPF keyboard focus is on whatever element triggered the rebuild
+    /// (typically the layout toolbar button). Without explicit restoration
+    /// the user has to click the pane again before typing — and even after
+    /// a single Focus() call the WPF IME context can stay un-rebound, so
+    /// English passes through but Korean / Japanese / Chinese silently
+    /// drops the first keystrokes. The two-stage focus dance below is the
+    /// programmatic equivalent of the workaround users discover (click
+    /// another pane, then click back) and forces IME re-association.
+    /// </summary>
+    private void RestoreKeyboardFocusToFocusedPane()
+    {
+        var focusedPaneId = _surface?.FocusedPaneId;
+        if (string.IsNullOrEmpty(focusedPaneId)) return;
+        if (!_terminalCache.TryGetValue(focusedPaneId, out var terminal)) return;
+
+        // The IME-eligible target is the hidden TextBox proxy paired with
+        // the terminal — that's where Windows TSF actually composes Korean.
+        _imeProxyCache.TryGetValue(focusedPaneId, out var imeProxy);
+
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (!terminal.IsLoaded) return;
+
+            // Stage 1: park focus on the container so any stale IME binding
+            // from before the rebuild is broken.
+            Focusable = true;
+            Focus();
+
+            // Stage 2: keyboard focus to the IME proxy if we have one,
+            // otherwise the terminal control as a fallback.
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (imeProxy != null && imeProxy.IsLoaded)
+                    Keyboard.Focus(imeProxy);
+                else if (terminal.IsLoaded)
+                    Keyboard.Focus(terminal);
+            }, System.Windows.Threading.DispatcherPriority.Input);
+        }, System.Windows.Threading.DispatcherPriority.Input);
     }
 
     private UIElement BuildNode(SplitNode node)
@@ -133,11 +192,16 @@ public class SplitPaneContainer : ContentControl
         }
         else
         {
-            // Detach from old parent before reusing
-            // Terminal could be inside DockPanel (with header) or Border
+            // Detach from old parent before reusing.
+            // Parent could be Grid (current layout pairs terminal with IME
+            // proxy in a Grid), DockPanel (older layout), or Border.
             var oldParent = System.Windows.Media.VisualTreeHelper.GetParent(terminal) as FrameworkElement;
-            
-            if (oldParent is DockPanel dockPanel)
+
+            if (oldParent is Grid oldGrid)
+            {
+                oldGrid.Children.Remove(terminal);
+            }
+            else if (oldParent is DockPanel dockPanel)
             {
                 dockPanel.Children.Remove(terminal);
             }
@@ -263,17 +327,230 @@ public class SplitPaneContainer : ContentControl
         header.Child = headerGrid;
 
         panel.Children.Add(header);
-        panel.Children.Add(terminal);
 
-        var focusedAccent = GetThemeColor("AccentColor");
-        return new Border
+        // Hidden TextBox proxy for Windows TSF (Text Services Framework)
+        // integration. WPF's TextBox is the canonical IME-eligible surface,
+        // so the OS Korean / Japanese / Chinese IMEs compose syllables
+        // internally and only deliver the finalized result via TextChanged.
+        // The TerminalControl itself is a custom-drawn FrameworkElement
+        // without a TSF text store, which is why the previous custom
+        // HangulComposer approach kept hitting edge cases. We offload
+        // composition to TextBox and treat TerminalControl as pure render.
+        //
+        // Layout: TextBox sits in a Grid alongside TerminalControl, sized to
+        // 1×1 with Opacity=0 and IsHitTestVisible=false so it is invisible
+        // and mouse passes through to TerminalControl for selection / focus
+        // clicks. Keyboard focus is forwarded TerminalControl → proxy on
+        // FocusRequested.
+        if (!_imeProxyCache.TryGetValue(paneId, out var imeProxy))
+        {
+            imeProxy = new TextBox
+            {
+                // Real size + on-screen position is mandatory: a 1×1 or
+                // off-screen TextBox makes TSF think there's no valid input
+                // target, and Korean IME falls back to committing the first
+                // jamo immediately ("ㄱ" + "ㅏ" → "ㄱㅏ" instead of "가").
+                // We keep it on-screen at the top-left of the pane,
+                // visually invisible via Opacity / transparent brushes,
+                // and IsHitTestVisible=false so mouse passes through.
+                Width = 200,
+                Height = 28,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                Margin = new Thickness(0, 0, 0, 0),
+                Opacity = 0,
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                Foreground = Brushes.Transparent,
+                CaretBrush = Brushes.Transparent,
+                Padding = new Thickness(0),
+                AcceptsReturn = false,
+                AcceptsTab = false,
+                Focusable = true,
+                IsTabStop = false,
+                IsHitTestVisible = false,
+            };
+            _imeProxyCache[paneId] = imeProxy;
+
+            var capturedTerminal = terminal;
+
+            // Diagnostic — surface what IME events actually fire so we can
+            // tell whether TextInputUpdate is the right hook on this Windows
+            // / IME / TextBox combo. Logs to %LOCALAPPDATA%\cmuxw-toast.log.
+            var imeLogPath = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "cmuxw-toast.log");
+            void LogIme(string msg)
+            {
+                try { System.IO.File.AppendAllText(imeLogPath,
+                    $"[{DateTime.Now:HH:mm:ss.fff}] IME {msg}\n",
+                    System.Text.Encoding.UTF8); }
+                catch { }
+            }
+
+            // IME handling, mirroring xterm.js / VSCode terminal, following
+            // the strict spec:
+            //   1. Preedit (composing) NEVER goes to PTY — only commit does.
+            //   2. Preedit is shown via TerminalControl's overlay layer
+            //      (NOT by writing to TextBox.Text — that corrupts TSF and
+            //      causes first-jamo separation).
+            //   3. Two flags: isComposing (set Start, cleared on commit),
+            //      suppressNextTextChanged (set on commit, cleared exactly
+            //      once on the next TextChanged that fires from the Clear()).
+            //   4. TextChanged is ONLY a fallback path for paste / legacy
+            //      bulk commits — never the primary commit signal.
+            InputMethod.SetIsInputMethodEnabled(imeProxy, true);
+            InputMethod.SetPreferredImeConversionMode(imeProxy, ImeConversionModeValues.Native);
+
+            bool isComposing = false;
+            bool suppressNextTextChanged = false;
+
+            imeProxy.AddHandler(TextCompositionManager.TextInputStartEvent,
+                new TextCompositionEventHandler((_, _) =>
+                {
+                    LogIme("Start");
+                    isComposing = true;
+                    capturedTerminal.SetPreedit(string.Empty);
+                }),
+                handledEventsToo: true);
+
+            imeProxy.AddHandler(TextCompositionManager.TextInputUpdateEvent,
+                new TextCompositionEventHandler((_, e) =>
+                {
+                    var composing = e.TextComposition?.CompositionText
+                                    ?? e.Text
+                                    ?? string.Empty;
+                    LogIme($"Update composing='{composing}'");
+                    capturedTerminal.SetPreedit(composing);
+                    // PTY write 절대 금지
+                }),
+                handledEventsToo: true);
+
+            // PreviewTextInputUpdate as a fallback — some Windows builds
+            // route IME composition through the tunneling preview only.
+            imeProxy.AddHandler(TextCompositionManager.PreviewTextInputUpdateEvent,
+                new TextCompositionEventHandler((_, e) =>
+                {
+                    var composing = e.TextComposition?.CompositionText
+                                    ?? e.Text
+                                    ?? string.Empty;
+                    LogIme($"PreviewUpdate composing='{composing}'");
+                    capturedTerminal.SetPreedit(composing);
+                }),
+                handledEventsToo: true);
+
+            // commit 시점 — 유일한 PTY write 경로
+            imeProxy.AddHandler(TextCompositionManager.TextInputEvent,
+                new TextCompositionEventHandler((_, e) =>
+                {
+                    var committed = e.Text ?? e.TextComposition?.Text ?? string.Empty;
+                    LogIme($"TextInput commit='{committed}'");
+                    capturedTerminal.SetPreedit(string.Empty);
+                    isComposing = false;
+                    // 빈 commit은 TSF가 split / abort 시 phantom으로 발사
+                    // 하는 것 — write 안 함.
+                    if (string.IsNullOrEmpty(committed)) return;
+                    capturedTerminal.WriteFromInputProxy(committed);
+                    // ★ TextBox.Text는 절대 건드리지 않음. Clear()를 호출
+                    // 하면 (동기든 deferred든) TSF가 진행 중인 다음 음절
+                    // composition을 abort/split하여 빈 commit이나 자모
+                    // 단독 commit이 발생함 ("안녕하세요 → 안ㅕ하요" 증상).
+                    // Text가 누적되어도 우리는 e.Text만 사용하므로 PTY
+                    // write 동작에 영향 없음.
+                }),
+                handledEventsToo: true);
+
+            // TextChanged는 PTY write 경로에서 완전히 제외 + Text 건드리지
+            // 않음. 그저 IME가 자체 관리하도록 둠.
+            imeProxy.TextChanged += (s, e) =>
+            {
+                // 진단 로그만, 동작은 없음.
+                if (!isComposing && !suppressNextTextChanged && imeProxy.Text.Length > 0)
+                    LogIme($"TextChanged ignored len={imeProxy.Text.Length}");
+                suppressNextTextChanged = false;
+            };
+
+            imeProxy.PreviewKeyDown += (s, e) =>
+            {
+                if (e.Key == Key.ImeProcessed) return;
+
+                // Space: TextInput으로 안 오는 케이스가 있어 (한글 IME 환경)
+                // 직접 PTY로 write. modifier 없는 순수 Space만.
+                if (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None)
+                {
+                    capturedTerminal.SetPreedit(string.Empty);
+                    capturedTerminal.WriteFromInputProxy(" ");
+                    e.Handled = true;
+                    return;
+                }
+
+                // Ctrl+V (paste): TextChanged write 제거로 인한 보완.
+                if (e.Key == Key.V && Keyboard.Modifiers == ModifierKeys.Control)
+                {
+                    try
+                    {
+                        var clip = Clipboard.GetText();
+                        if (!string.IsNullOrEmpty(clip))
+                        {
+                            capturedTerminal.SetPreedit(string.Empty);
+                            capturedTerminal.WriteFromInputProxy(clip);
+                        }
+                    }
+                    catch { }
+                    e.Handled = true;
+                    return;
+                }
+
+                if (e.Key is Key.Enter or Key.Tab or Key.Up or Key.Down
+                    or Key.Left or Key.Right or Key.Home or Key.End
+                    or Key.PageUp or Key.PageDown or Key.Escape or Key.Back)
+                {
+                    capturedTerminal.SetPreedit(string.Empty);
+                }
+                capturedTerminal.HandleInputProxyKeyDown(e);
+            };
+
+            imeProxy.LostKeyboardFocus += (_, _) =>
+            {
+                isComposing = false;
+                capturedTerminal.SetPreedit(string.Empty);
+            };
+        }
+        else
+        {
+            // Detach from previous parent grid before re-adding.
+            if (System.Windows.Media.VisualTreeHelper.GetParent(imeProxy) is Grid prevGrid)
+                prevGrid.Children.Remove(imeProxy);
+        }
+
+        // Mouse / pane focus on the terminal moves keyboard focus to the
+        // proxy so the IME composition target stays in sync with what the
+        // user is "looking at". (Re-wired each BuildLeaf because
+        // TerminalControl.ClearEventHandlers wipes its event subscribers.)
+        var proxyForFocus = imeProxy;
+        terminal.FocusRequested += () =>
+        {
+            if (!proxyForFocus.IsKeyboardFocused) proxyForFocus.Focus();
+        };
+
+        var contentGrid = new Grid();
+        contentGrid.Children.Add(terminal);
+        contentGrid.Children.Add(imeProxy);
+        panel.Children.Add(contentGrid);
+
+        // Constant 2px on both states — varying the thickness would shift
+        // the inner content by 1px every focus change, which is visually
+        // jarring. UpdateFocusState only swaps the brush, never the layout.
+        var paneBorder = new Border
         {
             Child = panel,
             BorderBrush = terminal.IsPaneFocused
-                ? new SolidColorBrush(Color.FromArgb(153, focusedAccent.R, focusedAccent.G, focusedAccent.B))
+                ? GetThemeBrush("FocusedPaneBorderBrush")
                 : GetThemeBrush("BorderBrush"),
-            BorderThickness = new Thickness(1),
+            BorderThickness = new Thickness(2),
         };
+        _paneBorderCache[paneId] = paneBorder;
+        return paneBorder;
     }
 
 

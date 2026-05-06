@@ -33,7 +33,10 @@ public class VtParser
     private State _state = State.Ground;
     private readonly StringBuilder _params = new();
     private readonly StringBuilder _intermediates = new();
-    private readonly StringBuilder _oscString = new();
+    // OSC payloads are accumulated as raw bytes and UTF-8 decoded at dispatch
+    // time. Casting each byte to (char) corrupts CJK / emoji content because
+    // multi-byte UTF-8 sequences end up as separate Latin-1 codepoints.
+    private readonly List<byte> _oscBytes = [];
     private readonly List<int> _csiParams = [];
     private byte _collectChar;
 
@@ -199,7 +202,7 @@ public class VtParser
         if (b == (byte)']')
         {
             _state = State.OscString;
-            _oscString.Clear();
+            _oscBytes.Clear();
             return;
         }
 
@@ -349,45 +352,58 @@ public class VtParser
     {
         if (b == 0x07) // BEL terminates OSC
         {
-            OnOscDispatch?.Invoke(_oscString.ToString());
+            DispatchOsc();
             _state = State.Ground;
             return;
         }
 
-        if (b == 0x9C) // ST (8-bit)
-        {
-            OnOscDispatch?.Invoke(_oscString.ToString());
-            _state = State.Ground;
-            return;
-        }
+        // Intentionally do NOT honor 0x9C as 8-bit ST here. 0x9C is a valid
+        // UTF-8 continuation byte and appears in many CJK characters — e.g.
+        // "시" (U+C2DC) encodes to EC 8B 9C. Treating it as a terminator
+        // truncates OSC payloads mid-character and produces U+FFFD on decode.
+        // BEL (0x07) and ESC \ (0x1B 0x5C) are the only terminators we honor.
 
         if (b == 0x1B) // Possible ST (ESC \)
         {
             // Will be handled on next byte — peek ahead not needed,
             // the ESC handler will fire. But we need to dispatch first.
-            OnOscDispatch?.Invoke(_oscString.ToString());
+            DispatchOsc();
             _state = State.Escape;
             return;
         }
 
-        if (b >= 0x20 || b == 0x09) // Printable or tab
+        // Accept any byte except C0 controls so multi-byte UTF-8 sequences
+        // (CJK, emoji) survive intact for the dispatch-time decode below.
+        if (b >= 0x20 || b == 0x09)
         {
-            _oscString.Append((char)b);
+            _oscBytes.Add(b);
         }
+    }
+
+    private void DispatchOsc()
+    {
+        // Decode the accumulated OSC payload as UTF-8 so notification titles /
+        // bodies in Korean / Japanese / Chinese / emoji round-trip correctly.
+        var payload = _oscBytes.Count == 0
+            ? string.Empty
+            : Encoding.UTF8.GetString(_oscBytes.ToArray());
+        OnOscDispatch?.Invoke(payload);
     }
 
     private void ProcessDcs(byte b)
     {
-        // Simplified DCS handling — just consume until ST
-        if (b == 0x9C || b == 0x1B)
-            _state = b == 0x1B ? State.Escape : State.Ground;
+        // Simplified DCS handling — just consume until ST. We do not honor
+        // 0x9C as 8-bit ST because it collides with UTF-8 continuation bytes
+        // (see ProcessOscString for the full story). Only ESC \ ends a DCS.
+        if (b == 0x1B)
+            _state = State.Escape;
     }
 
     private void ProcessSosPmApc(byte b)
     {
-        // Consume until ST
-        if (b == 0x9C || b == 0x1B)
-            _state = b == 0x1B ? State.Escape : State.Ground;
+        // Consume until ST. Same UTF-8 reasoning as DCS / OSC: ignore 0x9C.
+        if (b == 0x1B)
+            _state = State.Escape;
     }
 
     private void ParseCsiParams()
@@ -427,7 +443,7 @@ public class VtParser
         _state = State.Ground;
         _params.Clear();
         _intermediates.Clear();
-        _oscString.Clear();
+        _oscBytes.Clear();
         _csiParams.Clear();
         _collectChar = 0;
         _utf8Remaining = 0;

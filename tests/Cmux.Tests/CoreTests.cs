@@ -109,6 +109,24 @@ public class VtParserTests
     }
 
     [Fact]
+    public void Feed_OscWith0x9CInUtf8Body_DoesNotTruncate()
+    {
+        // Regression: 0x9C is a valid UTF-8 continuation byte that appears in
+        // many CJK glyphs (e.g. "시" U+C2DC encodes to EC 8B 9C). Earlier
+        // versions of the parser honored 0x9C as 8-bit ST and truncated the
+        // OSC payload mid-character, producing U+FFFD on decode and a toast
+        // body like "메시지" → "메�".
+        var parser = new VtParser();
+        string? receivedOsc = null;
+        parser.OnOscDispatch = osc => receivedOsc = osc;
+
+        parser.Feed("\x1b]99;t=Claude;b=테스트 메시지\x07");
+
+        receivedOsc.Should().Be("99;t=Claude;b=테스트 메시지");
+        receivedOsc.Should().NotContain("�");
+    }
+
+    [Fact]
     public void Feed_EscSequence_RaisesOnEscDispatch()
     {
         var parser = new VtParser();
@@ -252,7 +270,7 @@ public class OscHandlerTests
     {
         var handler = new OscHandler();
         string? body = null;
-        handler.NotificationReceived += (t, s, b) => body = b;
+        handler.NotificationReceived += (t, s, b, id, ts) => body = b;
 
         handler.Handle("9;Agent is waiting for your input");
 
@@ -264,7 +282,7 @@ public class OscHandlerTests
     {
         var handler = new OscHandler();
         string? title = null, body = null;
-        handler.NotificationReceived += (t, s, b) => { title = t; body = b; };
+        handler.NotificationReceived += (t, s, b, id, ts) => { title = t; body = b; };
 
         handler.Handle("99;t=Claude Code;b=Waiting for input");
 
@@ -273,11 +291,25 @@ public class OscHandlerTests
     }
 
     [Fact]
+    public void Handle_Osc99_KeyValue_ParsesIdAndTimestamp()
+    {
+        var handler = new OscHandler();
+        string? capturedId = null;
+        DateTime? capturedTs = null;
+        handler.NotificationReceived += (t, s, b, id, ts) => { capturedId = id; capturedTs = ts; };
+
+        handler.Handle("99;t=Claude;b=done;i=run-42;ts=1700000000");
+
+        capturedId.Should().Be("run-42");
+        capturedTs.Should().Be(DateTimeOffset.FromUnixTimeSeconds(1700000000).UtcDateTime);
+    }
+
+    [Fact]
     public void Handle_Osc777_Notify_ParsesCorrectly()
     {
         var handler = new OscHandler();
         string? title = null, body = null;
-        handler.NotificationReceived += (t, s, b) => { title = t; body = b; };
+        handler.NotificationReceived += (t, s, b, id, ts) => { title = t; body = b; };
 
         handler.Handle("777;notify;Claude;Task completed");
 

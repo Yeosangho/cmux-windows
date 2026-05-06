@@ -6,6 +6,7 @@ using CommunityToolkit.Mvvm.Input;
 using Cmux.Core.IPC;
 using Cmux.Core.Models;
 using Cmux.Core.Services;
+using Microsoft.Toolkit.Uwp.Notifications;
 
 namespace Cmux.ViewModels;
 
@@ -239,24 +240,58 @@ public partial class MainViewModel : ObservableObject
     public void JumpToLatestUnread()
     {
         var latest = _notificationService.GetLatestUnread();
-        if (latest == null) return;
+        if (latest != null)
+            NavigateToNotification(latest);
+    }
 
-        // Find the workspace and surface
-        var workspace = Workspaces.FirstOrDefault(w => w.Workspace.Id == latest.WorkspaceId);
-        if (workspace != null)
+    /// <summary>
+    /// Jumps to a specific notification by its ID. Used by the toast click
+    /// activation handler so the user lands on the pane that triggered the
+    /// toast they actually clicked, even when newer notifications exist.
+    /// Falls back to JumpToLatestUnread when the notification has been
+    /// trimmed from history (defensive — rare).
+    /// </summary>
+    public void JumpToNotification(string? notificationId)
+    {
+        if (string.IsNullOrEmpty(notificationId))
         {
-            SelectedWorkspace = workspace;
-            var surface = workspace.Surfaces.FirstOrDefault(s => s.Surface.Id == latest.SurfaceId);
-            if (surface != null)
-            {
-                workspace.SelectedSurface = surface;
-                if (latest.PaneId != null)
-                {
-                    surface.FocusPane(latest.PaneId);
-                }
-            }
-            _notificationService.MarkAsRead(latest.Id);
+            JumpToLatestUnread();
+            return;
         }
+        var match = _notificationService.Notifications
+            .FirstOrDefault(n => n.Id == notificationId);
+        if (match != null)
+            NavigateToNotification(match);
+        else
+            JumpToLatestUnread();
+    }
+
+    /// <summary>
+    /// Selects the workspace / surface / pane the notification originated from
+    /// and marks it as read. Used by both the unread-shortcut and the toast
+    /// click activation handler in App.xaml.cs.
+    /// </summary>
+    public void NavigateToNotification(TerminalNotification notification)
+    {
+        if (notification == null) return;
+
+        var workspace = Workspaces.FirstOrDefault(w => w.Workspace.Id == notification.WorkspaceId);
+        if (workspace == null) return;
+
+        SelectedWorkspace = workspace;
+        var surface = workspace.Surfaces.FirstOrDefault(s => s.Surface.Id == notification.SurfaceId);
+        if (surface != null)
+        {
+            workspace.SelectedSurface = surface;
+            if (!string.IsNullOrEmpty(notification.PaneId))
+                surface.FocusPane(notification.PaneId);
+        }
+        _notificationService.MarkAsRead(notification.Id);
+
+        // If the notification panel is open over the terminal, close it so
+        // the user lands on the actual pane immediately.
+        if (NotificationPanelVisible)
+            ToggleNotificationPanel();
     }
 
     [RelayCommand]
@@ -414,6 +449,7 @@ public partial class MainViewModel : ObservableObject
             return command switch
             {
                 "NOTIFY" => HandleNotifyCommand(args),
+                "TOAST.NAVIGATE" => HandleToastNavigate(args),
                 "WORKSPACE.LIST" => HandleWorkspaceList(),
                 "WORKSPACE.CREATE" => HandleWorkspaceCreate(args),
                 "WORKSPACE.SELECT" => HandleWorkspaceSelect(args),
@@ -445,6 +481,56 @@ public partial class MainViewModel : ObservableObject
             NotificationSource.Cli);
 
         return JsonSerializer.Serialize(new { ok = true });
+    }
+
+    /// <summary>
+    /// Handles toast click activation forwarded from a transient cmux process
+    /// that the Windows COM activator launched. Parses the toast Argument
+    /// string, looks up the matching notification, brings the window to the
+    /// foreground, and navigates to the originating pane.
+    /// </summary>
+    private string HandleToastNavigate(Dictionary<string, string> args)
+    {
+        var argument = args.GetValueOrDefault("arg", string.Empty);
+        if (string.IsNullOrEmpty(argument))
+            return JsonSerializer.Serialize(new { ok = false, error = "missing arg" });
+
+        try
+        {
+            var parsed = ToastArguments.Parse(argument);
+            if (parsed.Get("action") != "jumpToNotification")
+                return JsonSerializer.Serialize(new { ok = false, error = "wrong action" });
+            var notificationId = parsed.Get("notificationId");
+            if (string.IsNullOrEmpty(notificationId))
+                return JsonSerializer.Serialize(new { ok = false, error = "missing notificationId" });
+
+            var match = _notificationService.Notifications
+                .FirstOrDefault(n => n.Id == notificationId);
+            if (match == null)
+                return JsonSerializer.Serialize(new { ok = false, error = "notification not found" });
+
+            // Foreground the window — Toolkit forwarding from a transient
+            // process gives us no implicit Activate, so do it explicitly.
+            // Fully-qualified WindowState because Cmux.Core.Models also
+            // defines a WindowState type used in session persistence.
+            var window = Application.Current?.MainWindow;
+            if (window != null)
+            {
+                if (window.WindowState == System.Windows.WindowState.Minimized)
+                    window.WindowState = System.Windows.WindowState.Normal;
+                window.Show();
+                window.Activate();
+                window.Topmost = true;
+                window.Topmost = false;
+            }
+
+            NavigateToNotification(match);
+            return JsonSerializer.Serialize(new { ok = true });
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { ok = false, error = ex.Message });
+        }
     }
 
     private string HandleWorkspaceList()

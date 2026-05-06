@@ -16,6 +16,9 @@
     <Color x:Key="AccentColor">#FF818CF8</Color>
     <Color x:Key="NotificationColor">#FF6366F1</Color>
     <Color x:Key="BorderColor">#FF2A2A3C</Color>
+    <!-- Pane focus indicator — clean blue, distinct from the lavender accent
+         so the active (keyboard-receiving) pane is unambiguous. -->
+    <Color x:Key="FocusedPaneBorderColor">#FF3B82F6</Color>
     <Color x:Key="SurfaceTabBackgroundColor">#FF161622</Color>
     <Color x:Key="SurfaceTabSelectedColor">#FF1E1E32</Color>
     <Color x:Key="DividerColor">#FF2E2E42</Color>
@@ -52,6 +55,7 @@
     <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
     <SolidColorBrush x:Key="NotificationBrush" Color="{StaticResource NotificationColor}" />
     <SolidColorBrush x:Key="BorderBrush" Color="{StaticResource BorderColor}" />
+    <SolidColorBrush x:Key="FocusedPaneBorderBrush" Color="{StaticResource FocusedPaneBorderColor}" />
     <SolidColorBrush x:Key="SurfaceTabBackgroundBrush" Color="{StaticResource SurfaceTabBackgroundColor}" />
     <SolidColorBrush x:Key="SurfaceTabSelectedBrush" Color="{StaticResource SurfaceTabSelectedColor}" />
     <SolidColorBrush x:Key="DividerBrush" Color="{StaticResource DividerColor}" />

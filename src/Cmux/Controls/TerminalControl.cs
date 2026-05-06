@@ -70,6 +70,54 @@ public class TerminalControl : FrameworkElement
     private readonly StringBuilder _textRunBuffer = new();
     private bool _suppressNextEnterTextInput;
 
+    // Cache of FormattedText for single wide CJK / Hangul / emoji cells. Each
+    // wide cell is rendered individually for grid alignment; without caching,
+    // every frame would allocate a fresh FormattedText AND walk WPF's font
+    // fallback chain (Latin fonts don't carry Korean glyphs), which dominates
+    // typing latency on screens dense with Hangul output. Cache key includes
+    // glyph + foreground colour + style flags. Cleared in InvalidateRenderCaches
+    // when theme / font / dpi changes.
+    private readonly struct WideTextKey : IEquatable<WideTextKey>
+    {
+        public readonly char Character;
+        public readonly uint FgArgb;
+        public readonly byte Style; // bit0 bold, bit1 italic, bit2 dim
+        public WideTextKey(char c, Color fg, bool bold, bool italic, bool dim)
+        {
+            Character = c;
+            FgArgb = ((uint)fg.A << 24) | ((uint)fg.R << 16) | ((uint)fg.G << 8) | fg.B;
+            Style = (byte)((bold ? 1 : 0) | (italic ? 2 : 0) | (dim ? 4 : 0));
+        }
+        public bool Equals(WideTextKey other) =>
+            Character == other.Character && FgArgb == other.FgArgb && Style == other.Style;
+        public override bool Equals(object? obj) => obj is WideTextKey k && Equals(k);
+        public override int GetHashCode() => HashCode.Combine(Character, FgArgb, Style);
+    }
+    private readonly Dictionary<WideTextKey, FormattedText> _wideTextCache = [];
+
+    // IME preedit (composing text) overlay. Drawn on top of the buffer at
+    // the cursor location with an underline, mirroring VSCode/xterm.js's
+    // approach of compositing the in-progress IME string visually rather
+    // than mutating the PTY. The PTY only ever receives committed text via
+    // WriteFromInputProxy, so there is no backspace dance and no buffer
+    // corruption. SplitPaneContainer's IME proxy calls SetPreedit during
+    // TextInputUpdate, then SetPreedit("") + WriteFromInputProxy on commit.
+    private string _preedit = string.Empty;
+
+    public void SetPreedit(string text)
+    {
+        var newText = text ?? string.Empty;
+        if (_preedit == newText) return;
+        _preedit = newText;
+        RequestRender(System.Windows.Threading.DispatcherPriority.Render);
+    }
+
+    // Software Hangul composer for CJK IME input on raw FrameworkElement.
+    // The OS IME on a WPF FrameworkElement (no TSF text store) hands us
+    // decomposed Compatibility Jamo instead of composed syllables, so we
+    // re-implement the composition algorithm in user space.
+    private readonly HangulComposer _hangulComposer = new();
+
     /// <summary>Fired when the pane wants focus.</summary>
     public event Action? FocusRequested;
     public event Action<string>? CommandSubmitted;
@@ -139,6 +187,12 @@ public class TerminalControl : FrameworkElement
         Cursor = Cursors.Arrow;
         AllowDrop = true;
 
+        // Enable IME so users can type CJK languages. The IME mode (Hangul /
+        // English / Hiragana / etc.) is left to the user's current setting —
+        // we deliberately don't force PreferredImeState to On, otherwise
+        // every focus gain would reset the user's Hangul/English toggle.
+        InputMethod.SetIsInputMethodEnabled(this, true);
+
         _selection.SelectionChanged += () => RequestRender(System.Windows.Threading.DispatcherPriority.Render);
 
         // Cursor blink
@@ -158,6 +212,43 @@ public class TerminalControl : FrameworkElement
                 RequestRender();
         };
         _cursorTimer.Start();
+    }
+
+    protected override void OnLostKeyboardFocus(KeyboardFocusChangedEventArgs e)
+    {
+        // Deliberately NOT flushing HangulComposer here. WPF emits transient
+        // LostKeyboardFocus → GotKeyboardFocus pairs during fast typing
+        // (internal popups, layout updates, focus scope shuffles); flushing on
+        // every loss would commit half-composed jamo prematurely AND the OS
+        // IME would reset its own composition state in sync, making
+        // subsequent jamo silently disappear. The composer carries state
+        // forward; the next jamo / non-jamo keystroke will trigger a natural
+        // commit, which preserves user-visible composition during these
+        // micro-blips. Special keys (Enter / Backspace / arrows) still flush
+        // via OnKeyDown because those are explicit user intents.
+        base.OnLostKeyboardFocus(e);
+    }
+
+    protected override void OnGotKeyboardFocus(KeyboardFocusChangedEventArgs e)
+    {
+        base.OnGotKeyboardFocus(e);
+
+        // Re-assert IME enablement on every focus gain. Across visual tree
+        // rebuilds (layout change / zoom toggle), the InputMethod attached
+        // properties can drift out of sync with the focused control,
+        // resulting in TextInput / IME composition not routing here on the
+        // first focus. Setting it again on focus gain forces re-binding
+        // so Korean / Japanese / Chinese input works on the very first
+        // keystroke without the user having to bounce focus elsewhere.
+        //
+        // Note: deliberately NOT calling SetPreferredImeState(InputMethodState.On)
+        // here. That coerces the IME into Hangul mode every focus gain, which
+        // under fast typing — when WPF emits transient focus blips —
+        // resets the user's Hangul/English toggle and breaks active
+        // composition. Letting the user's IME mode persist is the right
+        // default; SetIsInputMethodEnabled alone is enough to ensure
+        // TextInput routes here.
+        InputMethod.SetIsInputMethodEnabled(this, true);
     }
 
     public void AttachSession(TerminalSession session)
@@ -272,8 +363,12 @@ public class TerminalControl : FrameworkElement
         }
     }
 
-    private void RequestRender(System.Windows.Threading.DispatcherPriority priority = System.Windows.Threading.DispatcherPriority.Background)
+    private void RequestRender(System.Windows.Threading.DispatcherPriority priority = System.Windows.Threading.DispatcherPriority.Render)
     {
+        // Default priority used to be Background, which queued the render
+        // behind unrelated dispatcher work and added perceptible typing lag.
+        // Render runs ahead of Loaded/DataBind/Background, so PTY-driven
+        // redraws hit the screen before the next input event.
         if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
             return;
 
@@ -345,6 +440,7 @@ public class TerminalControl : FrameworkElement
         _typefaceBold = null;
         _typefaceItalic = null;
         _typefaceBoldItalic = null;
+        _wideTextCache.Clear();
     }
 
     private Typeface GetTypeface(bool bold, bool italic)
@@ -441,7 +537,12 @@ public class TerminalControl : FrameworkElement
                         cell = TerminalCell.Empty;
                     }
 
+                    // Skip continuation cells of wide characters (Width=0)
+                    if (cell.Width == 0)
+                        continue;
+
                     double x = c * _cellWidth;
+                    double cellRenderWidth = cell.Width >= 2 ? _cellWidth * 2 : _cellWidth;
                     var attr = cell.Attribute;
                     bool isSelected = _selection.IsSelected(visRow, c);
                     bool isInverse = attr.Flags.HasFlag(CellFlags.Inverse) != isSelected;
@@ -466,27 +567,30 @@ public class TerminalControl : FrameworkElement
                     if (!cellBg.IsDefault)
                     {
                         dc.DrawRectangle(GetCachedBrush(ToWpfColor(cellBg)), null,
-                            new Rect(x, y, _cellWidth, _cellHeight));
+                            new Rect(x, y, cellRenderWidth, _cellHeight));
                     }
 
                     // Search match highlight (behind text)
                     bool isSearchMatch = searchMatchSet.Contains((visRow, c));
                     bool isCurrentMatch = currentMatchSet.Contains((visRow, c));
                     if (isCurrentMatch)
-                        dc.DrawRectangle(currentMatchBrush, null, new Rect(x, y, _cellWidth, _cellHeight));
+                        dc.DrawRectangle(currentMatchBrush, null, new Rect(x, y, cellRenderWidth, _cellHeight));
                     else if (isSearchMatch)
-                        dc.DrawRectangle(searchMatchBrush, null, new Rect(x, y, _cellWidth, _cellHeight));
+                        dc.DrawRectangle(searchMatchBrush, null, new Rect(x, y, cellRenderWidth, _cellHeight));
 
                     // URL hover highlight
                     if (_hoveredUrl is { } url && visRow == url.row && c >= url.startCol && c <= url.endCol)
                     {
                         var urlPen = new Pen(GetCachedBrush(Color.FromRgb(0x81, 0x8C, 0xF8)), 1);
                         urlPen.Freeze();
-                        dc.DrawLine(urlPen, new Point(x, y + _cellHeight - 1), new Point(x + _cellWidth, y + _cellHeight - 1));
+                        dc.DrawLine(urlPen, new Point(x, y + _cellHeight - 1), new Point(x + cellRenderWidth, y + _cellHeight - 1));
                     }
 
-                    // Text batching: group consecutive characters with same visual style
+                    // Text batching: group consecutive NARROW characters with same visual style.
+                    // Wide characters (Width >= 2) are rendered individually at exact grid
+                    // positions to avoid font-metric misalignment.
                     bool hasChar = cell.Character != '\0' && cell.Character != ' ';
+                    bool isWide = cell.Width >= 2;
                     if (hasChar)
                     {
                         var fgColor = cellFg.IsDefault ? ToWpfColor(_theme.Foreground) : ToWpfColor(cellFg);
@@ -496,29 +600,82 @@ public class TerminalControl : FrameworkElement
                         bool underline = attr.Flags.HasFlag(CellFlags.Underline);
                         bool strikethrough = attr.Flags.HasFlag(CellFlags.Strikethrough);
 
-                        // Style changed? Flush the current run first
-                        if (runStartCol >= 0 && (fgColor != runFgColor || bold != runBold ||
-                            italic != runItalic || dim != runDim ||
-                            underline != runUnderline || strikethrough != runStrikethrough))
+                        if (isWide)
                         {
-                            FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
-                            runStartCol = -1;
-                        }
+                            // Flush any pending narrow run before rendering wide char
+                            if (runStartCol >= 0)
+                            {
+                                FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
+                                runStartCol = -1;
+                            }
 
-                        // Start new run or continue existing
-                        if (runStartCol < 0)
+                            // Render wide character individually at exact grid position.
+                            // Cached by (char, fg, style) so subsequent frames skip the
+                            // FormattedText allocation + WPF font fallback chain — that
+                            // chain is the dominant typing-latency source on Hangul-
+                            // dense screens because Latin fonts have no Korean glyphs.
+                            var brush = dim
+                                ? GetCachedBrush(Color.FromArgb(128, fgColor.R, fgColor.G, fgColor.B))
+                                : GetCachedBrush(fgColor);
+                            var key = new WideTextKey(cell.Character, fgColor, bold, italic, dim);
+                            if (!_wideTextCache.TryGetValue(key, out var charText))
+                            {
+                                var tf = GetTypeface(bold, italic);
+                                charText = new FormattedText(
+                                    cell.Character.ToString(),
+                                    CultureInfo.CurrentCulture,
+                                    FlowDirection.LeftToRight,
+                                    tf,
+                                    _fontSize,
+                                    brush,
+                                    dpi);
+                                _wideTextCache[key] = charText;
+                            }
+                            // Center the glyph within the 2-cell space
+                            double glyphOffset = (cellRenderWidth - charText.WidthIncludingTrailingWhitespace) / 2;
+                            dc.DrawText(charText, new Point(x + Math.Max(0, glyphOffset), y));
+
+                            if (underline)
+                            {
+                                var pen = new Pen(brush, 1);
+                                pen.Freeze();
+                                dc.DrawLine(pen, new Point(x, y + _cellHeight - 1), new Point(x + cellRenderWidth, y + _cellHeight - 1));
+                            }
+                            if (strikethrough)
+                            {
+                                var pen = new Pen(brush, 1);
+                                pen.Freeze();
+                                dc.DrawLine(pen, new Point(x, y + _cellHeight / 2), new Point(x + cellRenderWidth, y + _cellHeight / 2));
+                            }
+                        }
+                        else
                         {
-                            runStartCol = c;
-                            runFgColor = fgColor;
-                            runBold = bold;
-                            runItalic = italic;
-                            runDim = dim;
-                            runUnderline = underline;
-                            runStrikethrough = strikethrough;
-                            _textRunBuffer.Clear();
-                        }
+                            // Narrow character — batch into text run
 
-                        _textRunBuffer.Append(cell.Character);
+                            // Style changed? Flush the current run first
+                            if (runStartCol >= 0 && (fgColor != runFgColor || bold != runBold ||
+                                italic != runItalic || dim != runDim ||
+                                underline != runUnderline || strikethrough != runStrikethrough))
+                            {
+                                FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
+                                runStartCol = -1;
+                            }
+
+                            // Start new run or continue existing
+                            if (runStartCol < 0)
+                            {
+                                runStartCol = c;
+                                runFgColor = fgColor;
+                                runBold = bold;
+                                runItalic = italic;
+                                runDim = dim;
+                                runUnderline = underline;
+                                runStrikethrough = strikethrough;
+                                _textRunBuffer.Clear();
+                            }
+
+                            _textRunBuffer.Append(cell.Character);
+                        }
                     }
                     else if (runStartCol >= 0)
                     {
@@ -533,10 +690,55 @@ public class TerminalControl : FrameworkElement
                     FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
             }
 
-            // Cursor (only when viewing live buffer)
+            // IME preedit overlay (composing string). Drawn at the cursor
+            // position with an underline and the terminal foreground color,
+            // covering whatever buffer cells are underneath. Cursor is moved
+            // to the end of the preedit so it sits "after" the composing
+            // text — matching standard text-editor preedit UX.
+            int preeditCols = 0;
+            if (!isScrolledBack && _preedit.Length > 0)
+            {
+                int row = buffer.CursorRow;
+                int col = buffer.CursorCol;
+                double pY = row * _cellHeight;
+                double pX = col * _cellWidth;
+                var fgPreedit = ToWpfColor(_theme.Foreground);
+                var bgPreedit = ToWpfColor(_theme.Background);
+                var fgBrush = GetCachedBrush(fgPreedit);
+                var bgBrush = GetCachedBrush(bgPreedit);
+
+                foreach (var ch in _preedit)
+                {
+                    int w = UnicodeWidth.GetWidth(ch);
+                    double cellRender = w >= 2 ? _cellWidth * 2 : _cellWidth;
+                    // Background block to cover any buffer text underneath.
+                    dc.DrawRectangle(bgBrush, null, new Rect(pX, pY, cellRender, _cellHeight));
+                    var t = new FormattedText(
+                        ch.ToString(),
+                        CultureInfo.CurrentCulture,
+                        FlowDirection.LeftToRight,
+                        _typeface,
+                        _fontSize,
+                        fgBrush,
+                        dpi);
+                    double glyphOffset = (cellRender - t.WidthIncludingTrailingWhitespace) / 2;
+                    dc.DrawText(t, new Point(pX + Math.Max(0, glyphOffset), pY));
+                    var underlinePen = new Pen(fgBrush, 1);
+                    underlinePen.Freeze();
+                    dc.DrawLine(underlinePen,
+                        new Point(pX, pY + _cellHeight - 1),
+                        new Point(pX + cellRender, pY + _cellHeight - 1));
+                    pX += cellRender;
+                    preeditCols += w;
+                }
+            }
+
+            // Cursor (only when viewing live buffer). Shifted past any
+            // active preedit so the caret sits where the next typed char
+            // will commit.
             if (!isScrolledBack && buffer.CursorVisible && IsPaneFocused && (_cursorVisible || !_cursorBlink))
             {
-                double cx = buffer.CursorCol * _cellWidth;
+                double cx = (buffer.CursorCol + preeditCols) * _cellWidth;
                 double cy = buffer.CursorRow * _cellHeight;
                 var cursorColor = _theme.CursorColor.HasValue
                     ? ToWpfColor(_theme.CursorColor.Value)
@@ -586,7 +788,9 @@ public class TerminalControl : FrameworkElement
     }
 
     /// <summary>
-    /// Draws a batched text run and its decorations (underline/strikethrough).
+    /// Draws a batched text run of narrow characters and its decorations
+    /// (underline / strikethrough). Wide CJK characters bypass this and are
+    /// drawn individually at the call site, centered in the 2-cell slot.
     /// </summary>
     private void FlushTextRun(DrawingContext dc, double dpi, double y, int startCol,
         Color fgColor, bool bold, bool italic, bool dim, bool underline, bool strikethrough)
@@ -766,9 +970,38 @@ public class TerminalControl : FrameworkElement
         return true;
     }
 
+    /// <summary>
+    /// Public entry point used by the IME-proxy TextBox in SplitPaneContainer
+    /// to forward keystrokes that don't belong to text composition (special
+    /// keys, shortcuts, control combos). Routes through the same logic as
+    /// when this control has focus directly.
+    /// </summary>
+    public void HandleInputProxyKeyDown(KeyEventArgs e) => OnKeyDown(e);
+
+    /// <summary>
+    /// Public entry point used by the IME-proxy TextBox to deliver text
+    /// committed by Windows TSF (post-IME composition). Bypasses the
+    /// per-control HangulComposer entirely — TSF already handed us a
+    /// finalized character sequence so we just stream it to the PTY.
+    /// </summary>
+    public void WriteFromInputProxy(string text)
+    {
+        if (_session == null || string.IsNullOrEmpty(text)) return;
+        EnsureLiveView();
+        TrackInputText(text);
+        _session.Write(text);
+        _selection.ClearSelection();
+    }
+
     protected override void OnKeyDown(KeyEventArgs e)
     {
         if (_session == null) return;
+
+        // Let the IME consume keystrokes that belong to an active composition.
+        // Without this, Korean/Japanese/Chinese jamo would leak into the
+        // OnKeyDown -> KeyToVtSequence path while still composing.
+        if (e.Key == Key.ImeProcessed)
+            return;
 
         var modifiers = Keyboard.Modifiers;
         bool ctrl = modifiers.HasFlag(ModifierKeys.Control);
@@ -829,6 +1062,20 @@ public class TerminalControl : FrameworkElement
             _session.Write(ctrlSequence);
             e.Handled = true;
             return;
+        }
+
+        // Flush any pending Hangul composition before processing special keys
+        // (Enter, arrows, Backspace, etc.) — they should commit whatever
+        // syllable is currently being built.
+        if (_hangulComposer.IsComposing)
+        {
+            var flushed = _hangulComposer.Flush();
+            if (!string.IsNullOrEmpty(flushed))
+            {
+                EnsureLiveView();
+                TrackInputText(flushed);
+                _session.Write(flushed);
+            }
         }
 
         bool appCursor = _session.Buffer.ApplicationCursorKeys;
@@ -894,9 +1141,21 @@ public class TerminalControl : FrameworkElement
             return;
         }
 
-        EnsureLiveView();
-        TrackInputText(e.Text);
-        _session.Write(e.Text);
+        // Feed each character through the Hangul composer. On a raw
+        // FrameworkElement the OS IME delivers decomposed Compatibility Jamo
+        // (e.g. ㅇ + ㅏ + ㄴ) instead of composed syllables; the composer
+        // reassembles them into Hangul Syllables (e.g. 안) before they hit
+        // the PTY. Non-Hangul characters pass through unchanged.
+        foreach (char c in e.Text)
+        {
+            var composed = _hangulComposer.Feed(c);
+            if (!string.IsNullOrEmpty(composed))
+            {
+                EnsureLiveView();
+                TrackInputText(composed);
+                _session.Write(composed);
+            }
+        }
         _selection.ClearSelection();
     }
 

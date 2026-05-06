@@ -1,41 +1,60 @@
-using Microsoft.Toolkit.Uwp.Notifications;
+using System.IO;
 using Cmux.Core.Models;
+using Microsoft.Toolkit.Uwp.Notifications;
 
 namespace Cmux.Services;
 
 /// <summary>
 /// Sends Windows toast notifications when AI coding agents need attention.
-/// Uses the Windows 10/11 notification system via Microsoft.Toolkit.Uwp.Notifications.
+/// Uses the CommunityToolkit Notifications API. For unpackaged Win32 apps
+/// the toolkit auto-registers an AumId, a Start Menu shortcut, and a COM
+/// activator the first time a toast is shown — the only thing the host app
+/// has to do is subscribe to <c>ToastNotificationManagerCompat.OnActivated</c>
+/// (done in App.OnStartup) so click activations actually reach our code.
 /// </summary>
 public static class ToastNotificationHelper
 {
-    /// <summary>
-    /// Shows a Windows toast notification for a terminal notification.
-    /// </summary>
     public static void ShowToast(TerminalNotification notification, string workspaceName)
     {
         try
         {
-            new ToastContentBuilder()
-                .AddText(notification.Title)
-                .AddText(notification.Body)
+            var builder = new ToastContentBuilder()
+                .AddText(notification.Title ?? string.Empty)
+                .AddText(notification.Body ?? string.Empty)
                 .AddAttributionText($"Workspace: {workspaceName}")
+                // Activation arguments — read back in App's OnActivated handler
+                // via ToastArguments.Parse and dispatched to MainViewModel.
                 .AddArgument("action", "jumpToNotification")
                 .AddArgument("notificationId", notification.Id)
                 .AddArgument("workspaceId", notification.WorkspaceId)
                 .AddArgument("surfaceId", notification.SurfaceId)
-                .Show();
+                // Explicit notification sound. Without an AddAudio call some
+                // Windows configurations render the toast silently.
+                .AddAudio(new System.Uri("ms-winsoundevent:Notification.Default"));
+            if (!string.IsNullOrEmpty(notification.PaneId))
+                builder.AddArgument("paneId", notification.PaneId);
+
+            // Diagnostic — append the body we hand to the toolkit so we can
+            // compare emitted vs displayed if a bug reappears.
+            try
+            {
+                var logPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "cmuxw-toast.log");
+                File.AppendAllText(logPath,
+                    $"[{DateTime.Now:HH:mm:ss.fff}] ShowToast id={notification.Id} title='{notification.Title}' body='{notification.Body}'\n",
+                    System.Text.Encoding.UTF8);
+            }
+            catch { }
+
+            builder.Show();
         }
-        catch
+        catch (Exception ex)
         {
-            // Toast notifications may fail in certain environments
-            // (no UWP support, sandboxed, etc). Non-critical.
+            System.Diagnostics.Debug.WriteLine($"[Toast] ShowToast failed: {ex}");
         }
     }
 
-    /// <summary>
-    /// Clears all cmux toast notifications from the notification center.
-    /// </summary>
     public static void ClearAll()
     {
         try

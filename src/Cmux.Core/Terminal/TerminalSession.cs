@@ -40,7 +40,8 @@ public sealed class TerminalSession : IDisposable
     public event Action? ProcessExited;
     public event Action<string>? TitleChanged;
     public event Action<string>? WorkingDirectoryChanged;
-    public event Action<string, string?, string>? NotificationReceived;
+    // title, subtitle, body, sender-supplied id (or null), sender-supplied timestamp (or null)
+    public event Action<string, string?, string, string?, DateTime?>? NotificationReceived;
     public event Action<char, string?>? ShellPromptMarker;
     public event Action? Redraw;
     public event Action? BellReceived;
@@ -133,9 +134,9 @@ public sealed class TerminalSession : IDisposable
             WorkingDirectoryChanged?.Invoke(dir);
         };
 
-        _oscHandler.NotificationReceived += (title, subtitle, body) =>
+        _oscHandler.NotificationReceived += (title, subtitle, body, id, ts) =>
         {
-            NotificationReceived?.Invoke(title, subtitle, body);
+            NotificationReceived?.Invoke(title, subtitle, body, id, ts);
         };
 
         _oscHandler.ShellPromptMarker += (marker, payload) =>
