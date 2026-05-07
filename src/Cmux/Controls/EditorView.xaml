@@ -1,0 +1,110 @@
+<UserControl x:Class="Cmux.Controls.EditorView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:Cmux.ViewModels"
+             xmlns:avalon="http://icsharpcode.net/sharpdevelop/avalonedit"
+             Background="{StaticResource BackgroundBrush}">
+
+    <!-- Open file tabs + editor + status/save bar (folder tree lives in main sidebar) -->
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="34" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="{StaticResource SurfaceTabBackgroundBrush}"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+            <ItemsControl ItemsSource="{Binding OpenFiles}">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:EditorOpenFileViewModel}">
+                        <Border x:Name="tabBorder" Padding="10,4" Margin="2,4,2,4"
+                                Cursor="Hand" CornerRadius="6"
+                                Background="Transparent"
+                                MouseLeftButtonDown="FileTab_Click">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="{Binding Name}" FontSize="12"
+                                           Foreground="{StaticResource ForegroundDimBrush}"
+                                           VerticalAlignment="Center" x:Name="tabText" />
+                                <TextBlock Text="•" Margin="6,0,0,0" FontSize="12"
+                                           Foreground="{StaticResource AccentBrush}"
+                                           VerticalAlignment="Center"
+                                           Visibility="{Binding IsDirty, Converter={StaticResource BoolToVisibility}}" />
+                                <Button Content="&#xE10A;" FontFamily="Segoe MDL2 Assets"
+                                        FontSize="8" Margin="8,0,0,0" Padding="2"
+                                        Click="CloseFile_Click" Tag="{Binding}" />
+                            </StackPanel>
+                        </Border>
+                        <DataTemplate.Triggers>
+                            <DataTrigger Value="True">
+                                <DataTrigger.Binding>
+                                    <MultiBinding Converter="{StaticResource EqualityConverter}">
+                                        <Binding />
+                                        <Binding RelativeSource="{RelativeSource AncestorType=UserControl}"
+                                                 Path="DataContext.ActiveFile" />
+                                    </MultiBinding>
+                                </DataTrigger.Binding>
+                                <Setter TargetName="tabBorder" Property="Background"
+                                        Value="{StaticResource SurfaceTabSelectedBrush}" />
+                                <Setter TargetName="tabText" Property="Foreground"
+                                        Value="{StaticResource ForegroundBrush}" />
+                                <Setter TargetName="tabText" Property="FontWeight" Value="SemiBold" />
+                            </DataTrigger>
+                        </DataTemplate.Triggers>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </Border>
+
+        <Grid Grid.Row="1">
+            <avalon:TextEditor x:Name="Editor"
+                               FontFamily="Cascadia Code"
+                               FontSize="13"
+                               Background="{StaticResource BackgroundBrush}"
+                               Foreground="{StaticResource ForegroundBrush}"
+                               LineNumbersForeground="{StaticResource ForegroundDimBrush}"
+                               ShowLineNumbers="True"
+                               WordWrap="False"
+                               IsReadOnly="False"
+                               Visibility="{Binding ActiveFile, Converter={StaticResource NullToCollapsed}}" />
+            <TextBlock Text="No file open. Open a file from the workspace folder tree on the left."
+                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                       Foreground="{StaticResource ForegroundDimBrush}"
+                       Visibility="{Binding ActiveFile, Converter={StaticResource NullToCollapsed}, ConverterParameter=invert}" />
+        </Grid>
+
+        <Border Grid.Row="2" Background="{StaticResource SidebarBackgroundBrush}"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0"
+                Padding="10,4">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <!-- Error supersedes the file path so save failures (Permission
+                     denied on remote files, file in use, etc.) are always
+                     visible without the user having to dig. -->
+                <TextBlock Grid.Column="0"
+                           Text="{Binding ActiveFile.LoadError}"
+                           Foreground="#FFEF4444"
+                           FontSize="11" FontWeight="SemiBold"
+                           VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"
+                           Visibility="{Binding ActiveFile.LoadError, Converter={StaticResource NullToCollapsed}}" />
+                <TextBlock Grid.Column="0" Text="{Binding ActiveFile.FullPath, FallbackValue=''}"
+                           Foreground="{StaticResource ForegroundDimBrush}"
+                           FontSize="11" VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"
+                           Visibility="{Binding ActiveFile.LoadError, Converter={StaticResource NullToCollapsed}, ConverterParameter=invert}" />
+                <Button Grid.Column="1" Content="Save  (Ctrl+S)" Padding="10,3"
+                        Style="{StaticResource CmuxButton}"
+                        Click="SaveActive_Click" />
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>

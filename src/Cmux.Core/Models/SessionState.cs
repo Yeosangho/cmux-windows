@@ -39,6 +39,9 @@ public class WorkspaceState
 
     [JsonPropertyName("selectedSurfaceIndex")]
     public int? SelectedSurfaceIndex { get; set; }
+
+    [JsonPropertyName("editorFolders")]
+    public List<EditorFolder> EditorFolders { get; set; } = [];
 }
 
 public class SurfaceState

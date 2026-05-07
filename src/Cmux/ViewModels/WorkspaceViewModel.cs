@@ -6,9 +6,35 @@ using Cmux.Core.Services;
 
 namespace Cmux.ViewModels;
 
+public enum WorkspaceViewMode
+{
+    Terminal,
+    Editor,
+}
+
 public partial class WorkspaceViewModel : ObservableObject, IDisposable
 {
     public Workspace Workspace { get; }
+
+    [ObservableProperty]
+    private WorkspaceViewMode _viewMode = WorkspaceViewMode.Terminal;
+
+    public bool IsTerminalViewActive => ViewMode == WorkspaceViewMode.Terminal;
+    public bool IsEditorViewActive => ViewMode == WorkspaceViewMode.Editor;
+
+    public EditorViewModel Editor { get; }
+
+    [RelayCommand]
+    public void ShowTerminalView() => ViewMode = WorkspaceViewMode.Terminal;
+
+    [RelayCommand]
+    public void ShowEditorView() => ViewMode = WorkspaceViewMode.Editor;
+
+    partial void OnViewModeChanged(WorkspaceViewMode value)
+    {
+        OnPropertyChanged(nameof(IsTerminalViewActive));
+        OnPropertyChanged(nameof(IsEditorViewActive));
+    }
 
     [ObservableProperty]
     private string _name;
@@ -60,6 +86,7 @@ public partial class WorkspaceViewModel : ObservableObject, IDisposable
         _iconGlyph = workspace.IconGlyph;
         _accentColor = workspace.AccentColor;
         _notificationService = notificationService;
+        Editor = new EditorViewModel(workspace);
 
         // Create surface VMs for existing surfaces
         foreach (var surface in workspace.Surfaces)
@@ -218,5 +245,6 @@ public partial class WorkspaceViewModel : ObservableObject, IDisposable
         _infoRefreshTimer?.Dispose();
         foreach (var surface in Surfaces)
             surface.Dispose();
+        Editor.Dispose();
     }
 }

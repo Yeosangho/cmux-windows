@@ -33,27 +33,31 @@ public struct TerminalColor : IEquatable<TerminalColor>
 
     public static TerminalColor FromIndex(int index)
     {
-        // Standard 256-color lookup
+        // 16-color palette tuned for dark backgrounds. VGA defaults
+        // (0xAA series + 0x0000AA blue) are too saturated and the navy-blue
+        // index 4 used by `ls --color` for directories disappears against the
+        // editor background. Values mirror VS Code's "Dark+" terminal palette,
+        // which is widely familiar and readable.
         if (index < 16)
         {
             return index switch
             {
-                0 => new(0x00, 0x00, 0x00),
-                1 => new(0xAA, 0x00, 0x00),
-                2 => new(0x00, 0xAA, 0x00),
-                3 => new(0xAA, 0x55, 0x00),
-                4 => new(0x00, 0x00, 0xAA),
-                5 => new(0xAA, 0x00, 0xAA),
-                6 => new(0x00, 0xAA, 0xAA),
-                7 => new(0xAA, 0xAA, 0xAA),
-                8 => new(0x55, 0x55, 0x55),
-                9 => new(0xFF, 0x55, 0x55),
-                10 => new(0x55, 0xFF, 0x55),
-                11 => new(0xFF, 0xFF, 0x55),
-                12 => new(0x55, 0x55, 0xFF),
-                13 => new(0xFF, 0x55, 0xFF),
-                14 => new(0x55, 0xFF, 0xFF),
-                15 => new(0xFF, 0xFF, 0xFF),
+                0 => new(0x00, 0x00, 0x00),  // black
+                1 => new(0xCD, 0x31, 0x31),  // red
+                2 => new(0x0D, 0xBC, 0x79),  // green
+                3 => new(0xE5, 0xE5, 0x10),  // yellow
+                4 => new(0x24, 0x72, 0xC8),  // blue — readable on dark bg (was #0000AA)
+                5 => new(0xBC, 0x3F, 0xBC),  // magenta
+                6 => new(0x11, 0xA8, 0xCD),  // cyan
+                7 => new(0xE5, 0xE5, 0xE5),  // white / light gray
+                8 => new(0x66, 0x66, 0x66),  // bright black (gray)
+                9 => new(0xF1, 0x4C, 0x4C),  // bright red
+                10 => new(0x23, 0xD1, 0x8B), // bright green
+                11 => new(0xF5, 0xF5, 0x43), // bright yellow
+                12 => new(0x3B, 0x8E, 0xEA), // bright blue
+                13 => new(0xD6, 0x70, 0xD6), // bright magenta
+                14 => new(0x29, 0xB8, 0xDB), // bright cyan
+                15 => new(0xFF, 0xFF, 0xFF), // bright white
                 _ => Default,
             };
         }

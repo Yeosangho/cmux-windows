@@ -343,6 +343,9 @@ public partial class MainViewModel : ObservableObject
                 WorkingDirectory = wsState.WorkingDirectory,
             };
 
+            foreach (var folder in wsState.EditorFolders)
+                workspace.EditorFolders.Add(folder);
+
             foreach (var surfState in wsState.Surfaces)
             {
                 var surface = new Surface

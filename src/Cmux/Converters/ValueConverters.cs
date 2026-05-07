@@ -42,11 +42,24 @@ public class IntToVisibilityConverter : IValueConverter
         throw new NotImplementedException();
 }
 
-/// <summary>Non-null/non-empty string to Visible, otherwise Collapsed.</summary>
+/// <summary>Non-null/non-empty string to Visible, otherwise Collapsed.
+/// If the value is any non-string object, treats null as Collapsed and non-null as Visible.
+/// Pass "invert" as ConverterParameter to flip the result.</summary>
 public class NullToCollapsedConverter : IValueConverter
 {
-    public object Convert(object value, Type targetType, object parameter, CultureInfo culture) =>
-        value is string s && !string.IsNullOrEmpty(s) ? Visibility.Visible : Visibility.Collapsed;
+    public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+    {
+        bool present = value switch
+        {
+            null => false,
+            string s => !string.IsNullOrEmpty(s),
+            _ => true,
+        };
+
+        bool invert = string.Equals(parameter as string, "invert", StringComparison.OrdinalIgnoreCase);
+        if (invert) present = !present;
+        return present ? Visibility.Visible : Visibility.Collapsed;
+    }
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>
         throw new NotImplementedException();

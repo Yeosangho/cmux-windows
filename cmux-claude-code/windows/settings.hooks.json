@@ -1,0 +1,36 @@
+{
+  "_comment": "Replace <USERPROFILE> with the actual home path (e.g. C:\\Users\\user). PowerShell does NOT expand %USERPROFILE% in -File arguments — Claude Code on Windows invokes the hook command without going through cmd.exe, so env-var tokens stay literal. Use an absolute path here.",
+  "PreToolUse": [
+    {
+      "matcher": "AskUserQuestion|ExitPlanMode",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "powershell -ExecutionPolicy Bypass -NoProfile -File \"<USERPROFILE>\\.claude\\notify.ps1\" \"질문 대기\""
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "powershell -ExecutionPolicy Bypass -NoProfile -File \"<USERPROFILE>\\.claude\\notify.ps1\" \"응답 완료\""
+        }
+      ]
+    }
+  ],
+  "Elicitation": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "powershell -ExecutionPolicy Bypass -NoProfile -File \"<USERPROFILE>\\.claude\\notify.ps1\" \"입력 요청\""
+        }
+      ]
+    }
+  ]
+}

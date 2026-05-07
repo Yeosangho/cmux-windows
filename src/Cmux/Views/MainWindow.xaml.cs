@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Collections.ObjectModel;
 using System.Windows.Data;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Threading;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -157,6 +158,86 @@ public partial class MainWindow : Window
         _workspaceView?.Refresh();
     }
 
+    // Win32 horizontal-wheel (tilt-wheel) hook so the workspace folder tree
+    // scrolls left/right with a tilt-wheel mouse. WPF's MouseWheel event only
+    // reports vertical deltas; the OS sends WM_MOUSEHWHEEL separately and we
+    // have to forward it ourselves to the appropriate ScrollViewer.
+    private const int WM_MOUSEHWHEEL = 0x020E;
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        var src = HwndSource.FromHwnd(new WindowInteropHelper(this).Handle);
+        src?.AddHook(HorizontalWheelHook);
+    }
+
+    private IntPtr HorizontalWheelHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg != WM_MOUSEHWHEEL) return IntPtr.Zero;
+
+        // wParam high word = signed wheel delta (positive = right, negative = left).
+        long w = wParam.ToInt64();
+        int delta = (short)((w >> 16) & 0xFFFF);
+
+        // lParam holds screen coords (low = X, high = Y).
+        int packed = lParam.ToInt32();
+        var screenPt = new Point((short)(packed & 0xFFFF), (short)((packed >> 16) & 0xFFFF));
+
+        try
+        {
+            var localPt = PointFromScreen(screenPt);
+            var hit = VisualTreeHelper.HitTest(this, localPt);
+            if (hit?.VisualHit == null) return IntPtr.Zero;
+
+            // Only forward when the cursor is inside a TreeView named FolderTree
+            // — the workspace folder tree in WorkspaceSidebarItem.
+            if (!IsInsideFolderTree(hit.VisualHit, out var sv)) return IntPtr.Zero;
+            if (sv == null) return IntPtr.Zero;
+
+            // One wheel notch = 120 units. Move ~3 line widths per notch.
+            sv.ScrollToHorizontalOffset(sv.HorizontalOffset + delta / 4.0);
+            handled = true;
+        }
+        catch
+        {
+            // PointFromScreen can throw if the window is in a transient state;
+            // swallow and let the system continue.
+        }
+        return IntPtr.Zero;
+    }
+
+    private static bool IsInsideFolderTree(DependencyObject start, out ScrollViewer? scrollViewer)
+    {
+        scrollViewer = null;
+        bool inFolderTree = false;
+        var current = start;
+        while (current != null)
+        {
+            if (current is TreeView tv && tv.Name == "FolderTree")
+            {
+                inFolderTree = true;
+                // The TreeView's visual subtree contains a ScrollViewer in its
+                // template; locate it so we can scroll horizontally.
+                scrollViewer = FindDescendant<ScrollViewer>(tv);
+                break;
+            }
+            current = VisualTreeHelper.GetParent(current);
+        }
+        return inFolderTree;
+    }
+
+    private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
+    {
+        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is T t) return t;
+            var d = FindDescendant<T>(child);
+            if (d != null) return d;
+        }
+        return null;
+    }
+
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         // Restore window position from session state if available
@@ -221,6 +302,50 @@ public partial class MainWindow : Window
 
     private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
     {
+        // VSCode-style unsaved-changes guard. Walk every workspace's editor and
+        // collect dirty files; if any, prompt Save All / Don't Save / Cancel.
+        var dirty = new List<ViewModels.EditorOpenFileViewModel>();
+        foreach (var ws in ViewModel.Workspaces)
+        {
+            if (ws.Editor == null) continue;
+            foreach (var f in ws.Editor.OpenFiles)
+                if (f.IsDirty) dirty.Add(f);
+        }
+        if (dirty.Count > 0)
+        {
+            var preview = string.Join("\n", dirty.Take(10).Select(f => $"  - {f.Name}"));
+            if (dirty.Count > 10) preview += $"\n  ... and {dirty.Count - 10} more";
+            var result = MessageBox.Show(this,
+                $"You have {dirty.Count} unsaved file(s):\n\n{preview}\n\nSave all before closing?",
+                "Unsaved changes",
+                MessageBoxButton.YesNoCancel,
+                MessageBoxImage.Warning);
+            if (result == MessageBoxResult.Cancel)
+            {
+                e.Cancel = true;
+                return;
+            }
+            if (result == MessageBoxResult.Yes)
+            {
+                foreach (var f in dirty)
+                {
+                    try { f.SaveAsync().GetAwaiter().GetResult(); }
+                    catch (Exception ex) { f.LoadError = $"Save failed: {ex.Message}"; }
+                    if (f.LoadError != null)
+                    {
+                        var keep = MessageBox.Show(this,
+                            $"Failed to save {f.Name}:\n{f.LoadError}\n\nClose anyway and lose changes?",
+                            "Save failed", MessageBoxButton.YesNo, MessageBoxImage.Error);
+                        if (keep == MessageBoxResult.No)
+                        {
+                            e.Cancel = true;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         _uiRefreshTimer.Stop();
         ViewModel.PropertyChanged -= ViewModel_PropertyChanged;
         App.AgentRuntime.RuntimeUpdated -= OnAgentRuntimeUpdated;
@@ -587,12 +712,17 @@ public partial class MainWindow : Window
 
     private void WorkspaceItem_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
+        // Inline folder tree lives inside each WorkspaceSidebarItem. Without
+        // this guard every click/scroll inside the tree would arm the
+        // workspace reorder drag, swallowing tree clicks.
+        if (IsWithinFolderTree(e.OriginalSource as DependencyObject)) return;
         _dragStartPoint = e.GetPosition(null);
     }
 
     private void WorkspaceItem_PreviewMouseMove(object sender, MouseEventArgs e)
     {
         if (e.LeftButton != MouseButtonState.Pressed) return;
+        if (IsWithinFolderTree(e.OriginalSource as DependencyObject)) return;
 
         var diff = _dragStartPoint - e.GetPosition(null);
         if (Math.Abs(diff.X) < SystemParameters.MinimumHorizontalDragDistance &&
@@ -604,6 +734,17 @@ public partial class MainWindow : Window
         {
             DragDrop.DoDragDrop(item, workspace, DragDropEffects.Move);
         }
+    }
+
+    private static bool IsWithinFolderTree(DependencyObject? source)
+    {
+        var current = source;
+        while (current != null)
+        {
+            if (current is System.Windows.Controls.TreeView) return true;
+            current = System.Windows.Media.VisualTreeHelper.GetParent(current);
+        }
+        return false;
     }
 
     private void WorkspaceItem_Drop(object sender, DragEventArgs e)

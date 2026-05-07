@@ -84,6 +84,7 @@ public class SessionPersistenceService
                 AccentColor = ws.AccentColor,
                 WorkingDirectory = ws.WorkingDirectory,
                 SelectedSurfaceIndex = ws.Surfaces.IndexOf(ws.SelectedSurface!),
+                EditorFolders = ws.EditorFolders.ToList(),
             };
 
             foreach (var surface in ws.Surfaces)

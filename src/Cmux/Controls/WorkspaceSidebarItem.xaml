@@ -3,6 +3,117 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="clr-namespace:Cmux.ViewModels">
 
+    <UserControl.Resources>
+        <!-- Folder tree node template — TextTrimming on the name keeps long
+             filenames from pushing the expander column off-viewport at deep
+             indents. -->
+        <HierarchicalDataTemplate DataType="{x:Type vm:EditorFolderNodeViewModel}"
+                                  ItemsSource="{Binding Children}">
+            <StackPanel Orientation="Horizontal" Margin="0,1">
+                <TextBlock Text="&#xE8B7;" FontFamily="Segoe MDL2 Assets" FontSize="11"
+                           Foreground="{StaticResource ForegroundDimBrush}"
+                           VerticalAlignment="Center" Margin="0,0,4,0"
+                           Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVisibility}}" />
+                <TextBlock Text="{Binding Name}" Foreground="{StaticResource ForegroundBrush}"
+                           VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis" />
+            </StackPanel>
+        </HierarchicalDataTemplate>
+
+        <!-- TreeViewItem with a dark-theme template — the default WPF style
+             paints the selected row in system Highlight (white-ish), which
+             collides with our white text. Override Background/Foreground
+             on IsSelected so the highlighted file stays readable. -->
+        <Style x:Key="FolderTreeItemStyle" TargetType="TreeViewItem">
+            <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+            <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Padding" Value="2" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TreeViewItem">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" MinWidth="10" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition />
+                            </Grid.RowDefinitions>
+                            <ToggleButton x:Name="Expander"
+                                          ClickMode="Press"
+                                          Focusable="False"
+                                          IsChecked="{Binding IsExpanded, RelativeSource={RelativeSource TemplatedParent}}"
+                                          Width="10" Height="14"
+                                          Background="Transparent">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="Transparent" Padding="0">
+                                            <Path x:Name="arrow" Width="8" Height="8"
+                                                  Stretch="Uniform"
+                                                  Data="M 0,0 L 4,4 L 0,8 Z"
+                                                  Fill="{StaticResource ForegroundDimBrush}"
+                                                  RenderTransformOrigin="0.5,0.5">
+                                                <Path.RenderTransform>
+                                                    <RotateTransform Angle="0" />
+                                                </Path.RenderTransform>
+                                            </Path>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsChecked" Value="True">
+                                                <Setter TargetName="arrow" Property="RenderTransform">
+                                                    <Setter.Value>
+                                                        <RotateTransform Angle="90" />
+                                                    </Setter.Value>
+                                                </Setter>
+                                                <Setter TargetName="arrow" Property="Fill" Value="{StaticResource ForegroundBrush}" />
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <Border x:Name="rowBorder" Grid.Column="1" Grid.ColumnSpan="2"
+                                    CornerRadius="3" Padding="{TemplateBinding Padding}"
+                                    Background="{TemplateBinding Background}">
+                                <ContentPresenter x:Name="PART_Header"
+                                                  ContentSource="Header"
+                                                  HorizontalAlignment="Stretch" />
+                            </Border>
+                            <!-- Children get an explicit left margin so the
+                                 hierarchy is visually obvious. Without this
+                                 the indent collapsed to the expander column
+                                 width (~10px) and looked like a flat list. -->
+                            <ItemsPresenter x:Name="ItemsHost"
+                                            Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="3"
+                                            Margin="14,0,0,0"
+                                            Visibility="Collapsed" />
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsExpanded" Value="True">
+                                <Setter TargetName="ItemsHost" Property="Visibility" Value="Visible" />
+                            </Trigger>
+                            <Trigger Property="HasItems" Value="False">
+                                <Setter TargetName="Expander" Property="Visibility" Value="Hidden" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="rowBorder" Property="Background"
+                                        Value="{StaticResource SidebarItemHoverBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="rowBorder" Property="Background"
+                                        Value="{StaticResource SidebarItemSelectedBrush}" />
+                                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </UserControl.Resources>
+
     <Grid>
         <Grid.ContextMenu>
             <ContextMenu>
@@ -73,6 +184,11 @@
                         <TextBlock Text="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="12" />
                     </MenuItem.Icon>
                 </MenuItem>
+                <MenuItem Header="Add Folder..." Click="AddFolder_Click">
+                    <MenuItem.Icon>
+                        <TextBlock Text="&#xE8DA;" FontFamily="Segoe MDL2 Assets" FontSize="12" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <Separator />
                 <MenuItem Header="Move Up" Click="MoveUp_Click">
                     <MenuItem.Icon>
@@ -95,6 +211,7 @@
             </ContextMenu>
         </Grid.ContextMenu>
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -192,5 +309,55 @@
                    FontSize="10" Margin="0,2,0,0"
                    TextTrimming="CharacterEllipsis" FontStyle="Italic"
                    Visibility="{Binding LatestNotificationText, Converter={StaticResource NullToCollapsed}}" />
+
+        <!-- Inline folder tree (visible only when workspace is selected) -->
+        <Grid x:Name="FolderTreeHost" Grid.Row="5" Margin="0,8,0,0" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Folders"
+                           Foreground="{StaticResource ForegroundDimBrush}"
+                           FontSize="10" FontWeight="SemiBold"
+                           VerticalAlignment="Center" />
+                <Button Grid.Column="1" Style="{StaticResource IconButton}"
+                        Width="20" Height="20"
+                        ToolTip="Add folder" Click="AddFolder_Click">
+                    <TextBlock Text="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="9" />
+                </Button>
+            </Grid>
+
+            <!-- MaxHeight bounds the tree so it scrolls inside its own
+                 viewport instead of stretching the workspace item and
+                 deferring scrolling to the outer ListBox. Both scrollbars
+                 are pinned visible so the user can always see the scroll
+                 surface regardless of indent depth or filename length. -->
+            <TreeView Grid.Row="1" x:Name="FolderTree"
+                      ItemsSource="{Binding Editor.RootFolders}"
+                      ItemContainerStyle="{StaticResource FolderTreeItemStyle}"
+                      Background="Transparent" BorderThickness="0"
+                      MaxHeight="360"
+                      ScrollViewer.HorizontalScrollBarVisibility="Visible"
+                      ScrollViewer.VerticalScrollBarVisibility="Visible"
+                      ScrollViewer.CanContentScroll="False"
+                      Margin="0,4,0,0"
+                      MouseDoubleClick="FolderTree_MouseDoubleClick">
+                <TreeView.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="Open in Cursor" Click="OpenInCursor_Click" />
+                        <MenuItem Header="Open in VSCode" Click="OpenInVsCode_Click" />
+                        <Separator />
+                        <MenuItem Header="Refresh" Click="RefreshFolder_Click" />
+                        <MenuItem Header="Remove root folder" Click="RemoveRootFolder_Click" />
+                    </ContextMenu>
+                </TreeView.ContextMenu>
+            </TreeView>
+        </Grid>
     </Grid>
 </UserControl>

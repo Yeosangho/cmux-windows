@@ -6,8 +6,9 @@
 
     <Grid>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*" />
             <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
             <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
 
@@ -117,8 +118,15 @@
             </ItemsControl.ItemTemplate>
         </ItemsControl>
 
+        <!-- Add surface button — sits immediately after the last tab -->
+        <Button Grid.Column="1" Content="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="12"
+                Style="{StaticResource CmuxButton}"
+                Click="AddTab_Click"
+                Padding="8,0" Margin="2" Opacity="0.6"
+                ToolTip="New surface (Ctrl+Shift+T)" />
+
         <!-- Inline search bar -->
-        <Border Grid.Column="1" CornerRadius="6" Margin="4"
+        <Border Grid.Column="2" CornerRadius="6" Margin="4"
                 Background="{StaticResource SurfaceHighBrush}" VerticalAlignment="Center"
                 Height="26" Width="220">
             <Grid>
@@ -151,12 +159,6 @@
                 </StackPanel>
             </Grid>
         </Border>
-
-        <!-- Add surface button -->
-        <Button Grid.Column="2" Content="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="12"
-                Style="{StaticResource CmuxButton}"
-                Click="AddTab_Click"
-                Padding="8,0" Margin="2,2,4,2" Opacity="0.6" />
 
         <!-- Inline rename overlay -->
         <TextBox x:Name="TabRenameBox" Visibility="Collapsed"

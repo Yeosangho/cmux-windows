@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using Cmux.ViewModels;
 using Cmux.Views;
 
@@ -9,13 +10,64 @@ namespace Cmux.Controls;
 
 public partial class WorkspaceSidebarItem : UserControl
 {
+    private ListBoxItem? _hostItem;
+
     public WorkspaceSidebarItem()
     {
         InitializeComponent();
+        Loaded += OnLoaded;
+        Unloaded += OnUnloaded;
     }
 
     private WorkspaceViewModel? Vm => DataContext as WorkspaceViewModel;
     private MainViewModel? MainVm => FindMainViewModel();
+
+    private void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        DetachFromHost();
+        _hostItem = FindAncestor<ListBoxItem>(this);
+        if (_hostItem != null)
+        {
+            _hostItem.Selected += OnHostSelected;
+            _hostItem.Unselected += OnHostUnselected;
+            UpdateFolderTreeVisibility(_hostItem.IsSelected);
+        }
+        else
+        {
+            UpdateFolderTreeVisibility(false);
+        }
+    }
+
+    private void OnUnloaded(object sender, RoutedEventArgs e) => DetachFromHost();
+
+    private void DetachFromHost()
+    {
+        if (_hostItem != null)
+        {
+            _hostItem.Selected -= OnHostSelected;
+            _hostItem.Unselected -= OnHostUnselected;
+            _hostItem = null;
+        }
+    }
+
+    private void OnHostSelected(object sender, RoutedEventArgs e) => UpdateFolderTreeVisibility(true);
+    private void OnHostUnselected(object sender, RoutedEventArgs e) => UpdateFolderTreeVisibility(false);
+
+    private void UpdateFolderTreeVisibility(bool selected)
+    {
+        FolderTreeHost.Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? start) where T : DependencyObject
+    {
+        var current = start;
+        while (current != null)
+        {
+            if (current is T match) return match;
+            current = VisualTreeHelper.GetParent(current);
+        }
+        return null;
+    }
 
     private void Rename_Click(object sender, RoutedEventArgs e) => StartRename();
 
@@ -108,6 +160,92 @@ public partial class WorkspaceSidebarItem : UserControl
     {
         if (MainVm is { } main && Vm is { } ws)
             main.CloseWorkspace(ws);
+    }
+
+    private void AddFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (Vm == null) return;
+        var dlg = new AddEditorFolderWindow
+        {
+            Owner = Window.GetWindow(this),
+        };
+        if (dlg.ShowDialog() == true && dlg.Result != null)
+        {
+            Vm.Editor.AddFolder(dlg.Result);
+        }
+    }
+
+    private void FolderTree_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (Vm == null) return;
+        if (sender is not TreeView tree) return;
+        if (tree.SelectedItem is not EditorFolderNodeViewModel node) return;
+        if (node.IsPlaceholder) return;
+
+        // Default editor: Cursor. Cursor reuses an already-open window for the
+        // same folder + brings it to the foreground, so no window-tracking
+        // needed on our side.
+        OpenInEditor(node, Cmux.Core.Services.CursorLauncher.CursorCommand);
+    }
+
+    private void OpenInEditor(EditorFolderNodeViewModel node, string editorCommand)
+    {
+        try
+        {
+            Cmux.Core.Services.CursorLauncher.OpenPath(node.Folder, node.FullPath, editorCommand);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                Window.GetWindow(this),
+                ex.Message,
+                "Open in editor failed",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+    }
+
+    private void OpenInCursor_Click(object sender, RoutedEventArgs e)
+    {
+        if (FolderTree.SelectedItem is EditorFolderNodeViewModel node && !node.IsPlaceholder)
+            OpenInEditor(node, Cmux.Core.Services.CursorLauncher.CursorCommand);
+    }
+
+    private void OpenInVsCode_Click(object sender, RoutedEventArgs e)
+    {
+        if (FolderTree.SelectedItem is EditorFolderNodeViewModel node && !node.IsPlaceholder)
+            OpenInEditor(node, Cmux.Core.Services.CursorLauncher.VsCodeCommand);
+    }
+
+    private void RefreshFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (Vm == null) return;
+        if (FolderTree.SelectedItem is EditorFolderNodeViewModel node)
+            Vm.Editor.RefreshFolder(node);
+    }
+
+    private void RemoveRootFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (Vm == null) return;
+        if (FolderTree.SelectedItem is not EditorFolderNodeViewModel node) return;
+
+        // Right-clicking inside a child node (or an "<error: ...>" placeholder
+        // produced by a failed remote load) leaves SelectedItem as that
+        // descendant, not the root. Walk up via folder Id so the menu item
+        // still works in those cases.
+        var root = node.IsRoot
+            ? node
+            : Vm.Editor.RootFolders.FirstOrDefault(r => r.Folder.Id == node.Folder.Id);
+        if (root == null) return;
+
+        var result = MessageBox.Show(
+            Window.GetWindow(this),
+            $"Remove '{root.Name}' from this workspace?",
+            "Remove Folder",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Question);
+        if (result == MessageBoxResult.OK)
+            Vm.Editor.RemoveFolder(root);
     }
 
     private void StartRename()

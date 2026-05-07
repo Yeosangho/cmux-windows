@@ -146,6 +146,14 @@ public class SplitPaneContainer : ContentControl
         // the terminal — that's where Windows TSF actually composes Korean.
         _imeProxyCache.TryGetValue(focusedPaneId, out var imeProxy);
 
+        // Both stages run at Background priority — fires immediately after
+        // the current input batch drains, but is below Input priority so
+        // it does not share the input pump's queue. Earlier code used
+        // DispatcherPriority.Input and produced a TextStore.GrantLockWorker
+        // FailFast on the very first proxy focus after a rebuild (the
+        // staging area would still pump pending IME events into a
+        // mid-attach TextStore). ApplicationIdle was tested too but caused
+        // visible focus lag, so Background is the right tradeoff.
         Dispatcher.BeginInvoke(() =>
         {
             if (!terminal.IsLoaded) return;
@@ -159,12 +167,12 @@ public class SplitPaneContainer : ContentControl
             // otherwise the terminal control as a fallback.
             Dispatcher.BeginInvoke(() =>
             {
-                if (imeProxy != null && imeProxy.IsLoaded)
+                if (imeProxy != null && imeProxy.IsLoaded && !imeProxy.IsKeyboardFocused)
                     Keyboard.Focus(imeProxy);
-                else if (terminal.IsLoaded)
+                else if (terminal.IsLoaded && !terminal.IsKeyboardFocused)
                     Keyboard.Focus(terminal);
-            }, System.Windows.Threading.DispatcherPriority.Input);
-        }, System.Windows.Threading.DispatcherPriority.Input);
+            }, System.Windows.Threading.DispatcherPriority.Background);
+        }, System.Windows.Threading.DispatcherPriority.Background);
     }
 
     private UIElement BuildNode(SplitNode node)
@@ -527,10 +535,20 @@ public class SplitPaneContainer : ContentControl
         // proxy so the IME composition target stays in sync with what the
         // user is "looking at". (Re-wired each BuildLeaf because
         // TerminalControl.ClearEventHandlers wipes its event subscribers.)
+        //
+        // Critical: defer the Focus() to Background priority. Calling it
+        // synchronously while the input staging area is still draining
+        // can recursively re-enter TextStore lock acquisition during the
+        // proxy's first TextStore attach and trigger a WPF FailFast.
         var proxyForFocus = imeProxy;
         terminal.FocusRequested += () =>
         {
-            if (!proxyForFocus.IsKeyboardFocused) proxyForFocus.Focus();
+            if (proxyForFocus.IsKeyboardFocused) return;
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (proxyForFocus.IsLoaded && !proxyForFocus.IsKeyboardFocused)
+                    proxyForFocus.Focus();
+            }, System.Windows.Threading.DispatcherPriority.Background);
         };
 
         var contentGrid = new Grid();

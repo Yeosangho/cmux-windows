@@ -18,4 +18,5 @@ public class Workspace
     public string? LatestNotificationText { get; set; }
     public int UnreadNotificationCount { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public ObservableCollection<EditorFolder> EditorFolders { get; set; } = [];
 }

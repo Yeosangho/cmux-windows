@@ -385,7 +385,7 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" /> <!-- Surface tabs -->
                         <RowDefinition Height="Auto" /> <!-- Toolbar -->
-                        <RowDefinition Height="*" />    <!-- Terminal content -->
+                        <RowDefinition Height="*" />    <!-- Terminal / Editor content -->
                         <RowDefinition Height="Auto" /> <!-- Status bar -->
                     </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
@@ -448,7 +448,10 @@
                         </StackPanel>
                     </Border>
 
-                    <!-- Terminal content -->
+                    <!-- Terminal content (cmuxw is now terminal-only;
+                         folder editing is delegated to Cursor / VSCode via
+                         the "Open in Cursor" entry on the workspace folder
+                         tree). -->
                     <ContentControl Grid.Row="2" Grid.Column="0" x:Name="ContentArea">
                         <controls:SplitPaneContainer x:Name="SplitPaneContainerControl"
                             DataContext="{Binding SelectedWorkspace.SelectedSurface}" />
