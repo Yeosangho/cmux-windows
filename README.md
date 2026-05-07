@@ -40,6 +40,19 @@ A dark, keyboard-first terminal multiplexer for Windows, inspired by tmux/cmux w
 ### 회귀 테스트
 - `tests/Cmux.Tests/CoreTests.cs`에 OSC 0x9C UTF-8 충돌, 알림 dedup, OSC 99 sender id/timestamp 파싱 등 회귀 테스트 추가
 
+### 5. 워크스페이스 폴더 트리 + 외부 에디터 연동
+- **워크스페이스 사이드바 inline 폴더 트리** — 각 워크스페이스 항목 안에 로컬 / 원격(SSH) 폴더 등록 가능. 사이드바 헤더 컨텍스트 메뉴의 `Add Folder...`로 추가, TreeView 컨텍스트 메뉴로 Refresh / Remove root folder.
+- **다크 테마 TreeView template** — IsSelected/IsMouseOver hover 색, 자체 expander chevron, 깊이별 indent + 긴 이름 ellipsis, 자체 viewport (MaxHeight 360) + 가로/세로 스크롤바 + 마우스 tilt-wheel(WM_MOUSEHWHEEL) 가로 스크롤.
+- **`Open in Cursor` / `Open in VSCode`** — 폴더/파일 더블클릭 또는 컨텍스트 메뉴로 외부 에디터를 `--new-window`로 launch. 원격 폴더는 `--remote ssh-remote+<alias>`로 Remote-SSH 위임. cmuxw 자체 에디터는 더 이상 사용하지 않고 git/IntelliSense/port-forward 등은 Cursor/VSCode가 담당.
+- **`AddEditorFolderWindow`** — `~/.ssh/config`의 host alias를 ComboBox로 표시(`SshConfigParser`). alias 선택 시 user/port/identity는 ssh_config에 위임하고 PasswordBox만 활성(키 passphrase / 비밀번호 모두 입력 가능). Manual entry 모드에서는 host/port/user/key/password 직접 입력.
+- **원격 SFTP transport는 OpenSSH `sftp.exe` 호출** (`OpenSshSftpService`) — `sftp.exe -b -`로 list/get/put 수행하므로 ssh_config의 ProxyJump / ProxyCommand / Match / Include / IdentityAgent 모두 그대로 동작. 비밀번호 / 키 passphrase는 SSH_ASKPASS helper 스크립트 + `SSH_ASKPASS_REQUIRE=force`로 비대화식 전달, OutputEncoding cp949로 인한 한국어 깨짐 회피.
+- **다크 시인성 보강** — `DarkTheme.xaml`에 implicit `ScrollBar` / `ComboBox` / `ComboBoxItem` / `PasswordBox` 스타일 추가. 다이얼로그와 TreeView 등 보조 컨트롤도 라이트 시스템 색이 새어 들어오지 않게 통일.
+
+### 6. Windows용 Claude Code hook 알림 (cmux-claude-code/windows/)
+- **신규 디렉토리** `cmux-claude-code/windows/` — README + `notify.ps1` + `settings.hooks.json` 템플릿. Windows의 Claude Code가 cmuxw 안에서 동작할 때 Stop / PreToolUse(`AskUserQuestion`/`ExitPlanMode`) / Elicitation 이벤트마다 cmuxw에 OSC 99 toast를 발화하도록 구성하는 Windows-side 자산.
+- **AttachConsole + CONOUT$ raw write 트랜스포트** — Linux 측 `notify.sh`의 `/proc/<ppid>/fd/1` walk와 등가. notify.ps1이 부모 process chain을 walk해 `cmux-daemon.exe`(또는 `cmuxw.exe`)를 찾고 그 직전 ancestor(ConPTY child PowerShell)에 `AttachConsole`한 뒤 `CreateFileW("CONOUT$")`로 raw UTF-8 OSC 99 byte를 write. hook stdout이 Claude Code에 capture되는 한계, NamedPipe NOTIFY 측 hang, PowerShell `OutputEncoding` cp949로 인한 한국어 깨짐을 모두 회피.
+- 진단 로그는 `%LOCALAPPDATA%\cmux\claude-notify.log`에 기록(시각, msg, transcript, summary, body, transport, 시도한 ancestor pid:name chain).
+
 ---
 
 ## Why / Who / What / How
