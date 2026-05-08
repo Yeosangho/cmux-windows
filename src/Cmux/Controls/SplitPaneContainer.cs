@@ -31,10 +31,76 @@ public class SplitPaneContainer : ContentControl
     private static SolidColorBrush GetThemeBrush(string key) =>
         Application.Current.Resources[key] as SolidColorBrush ?? Brushes.Transparent;
 
+    private BroadcastInputViewModel? _broadcastVm;
+
     public SplitPaneContainer()
     {
         Background = Brushes.Transparent;
         DataContextChanged += OnDataContextChanged;
+        Loaded += OnLoaded;
+        Unloaded += OnUnloaded;
+    }
+
+    private void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        // Subscribe to the broadcast bar's pane selection so we can repaint
+        // pane borders red when the user checks/unchecks them in the popup.
+        // Done here (not in ctor) because Application.Current.MainWindow may
+        // not exist yet at construction time.
+        if (_broadcastVm == null
+            && Application.Current?.MainWindow?.DataContext is MainViewModel mvm)
+        {
+            _broadcastVm = mvm.BroadcastInput;
+            _broadcastVm.SelectionChanged += OnBroadcastSelectionChanged;
+        }
+        // Repaint in case selection state already exists (e.g. surface
+        // rebuild after the user picked panes earlier).
+        OnBroadcastSelectionChanged();
+    }
+
+    private void OnUnloaded(object sender, RoutedEventArgs e)
+    {
+        if (_broadcastVm != null)
+        {
+            _broadcastVm.SelectionChanged -= OnBroadcastSelectionChanged;
+            _broadcastVm = null;
+        }
+    }
+
+    private void OnBroadcastSelectionChanged()
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            foreach (var paneId in _paneBorderCache.Keys)
+                ApplyBorderState(paneId);
+        });
+    }
+
+    /// <summary>
+    /// Single source of truth for pane border colour. Broadcast-selected
+    /// (red) wins over focused (blue) wins over inactive (subtle border) so
+    /// checked panes are unmistakable across surfaces. Thickness stays at
+    /// 2px in every state so swapping the brush never reflows the terminal
+    /// (varying thickness shifts grid contents by 1px on every focus).
+    /// </summary>
+    private void ApplyBorderState(string paneId)
+    {
+        if (!_paneBorderCache.TryGetValue(paneId, out var border)) return;
+        var focused = paneId == _surface?.FocusedPaneId;
+        // IsPaneTargeted reflects the current broadcast scope's resolved
+        // pane set (CurrentSurface / Workspace / manual Selected /
+        // ClaudeAll / ClaudeLocal / ClaudeSsh) — not just manual checks —
+        // so changing the scope ComboBox visibly recolours pane borders.
+        // Only paint red while the broadcast bar is open; otherwise the
+        // user has nothing actionable and the red ring is just noise.
+        var targeted = _broadcastVm is { IsVisible: true } b
+                       && b.IsPaneTargeted(paneId);
+
+        border.BorderBrush = targeted
+            ? GetThemeBrush("ErrorBrush")
+            : focused
+                ? GetThemeBrush("FocusedPaneBorderBrush")
+                : GetThemeBrush("BorderBrush");
     }
 
     private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
@@ -95,12 +161,7 @@ public class SplitPaneContainer : ContentControl
         {
             var focused = paneId == _surface.FocusedPaneId;
             terminal.IsPaneFocused = focused;
-            if (_paneBorderCache.TryGetValue(paneId, out var border))
-            {
-                border.BorderBrush = focused
-                    ? GetThemeBrush("FocusedPaneBorderBrush")
-                    : GetThemeBrush("BorderBrush");
-            }
+            ApplyBorderState(paneId);
         }
     }
 
@@ -568,6 +629,9 @@ public class SplitPaneContainer : ContentControl
             BorderThickness = new Thickness(2),
         };
         _paneBorderCache[paneId] = paneBorder;
+        // Broadcast-selected state may already apply (e.g. layout rebuild
+        // while the user has panes checked) — paint it now.
+        ApplyBorderState(paneId);
         return paneBorder;
     }
 

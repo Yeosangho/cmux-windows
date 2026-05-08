@@ -36,7 +36,6 @@ public class TerminalControl : FrameworkElement
     private int _scrollOffset; // Negative = scrolled into history, 0 = at bottom
     private bool _followOutput = true;
     private int _lastScrollbackCount;
-    private int _renderQueued;
 
     // Visibility-aware render gating. When the workspace this control belongs
     // to is not currently shown (e.g., the user switched to another workspace
@@ -52,6 +51,22 @@ public class TerminalControl : FrameworkElement
     // back to visible flushes one catch-up render.
     private volatile bool _isVisibleSnapshot;
     private int _renderPendingWhileHidden;
+
+    // Render coalescer. Without time-based throttling a single PTY chunk →
+    // BeginInvoke → Render cycle runs at chunk arrival pace; Claude
+    // streaming (50–200 tok/s) saturates the UI thread because each
+    // Render() is a full-viewport repaint. The DispatcherTimer below caps
+    // redraws at ~60fps (16ms) regardless of how fast chunks arrive, while
+    // a "dirty" flag lets a single chunk schedule a render and any number
+    // of follow-up chunks coalesce into the same tick.
+    //
+    // Timer is created + Started in the constructor on the UI thread and
+    // never stopped, so PTY-thread RequestRenders just need to set the
+    // dirty flag — no cross-thread Start() / dispatcher binding race.
+    // Idle ticks (dirty=0) are essentially free (one Interlocked read).
+    private System.Windows.Threading.DispatcherTimer? _renderCoalesceTimer;
+    private int _renderDirty;
+    private const int RenderIntervalMs = 16;
 
     private string _cursorStyle = "bar";
     private bool _cursorBlink = true;
@@ -213,6 +228,19 @@ public class TerminalControl : FrameworkElement
 
         _isVisibleSnapshot = IsVisible;
         IsVisibleChanged += OnIsVisibleChanged;
+
+        // Set up the render coalescer here on the UI thread so we never
+        // have to touch DispatcherTimer state from the PTY reader thread.
+        // Always-on at 16ms; idle ticks just check the dirty flag, which
+        // is cheap (one Interlocked.Exchange of 0).
+        _renderCoalesceTimer = new System.Windows.Threading.DispatcherTimer(
+            System.Windows.Threading.DispatcherPriority.Render,
+            Dispatcher)
+        {
+            Interval = TimeSpan.FromMilliseconds(RenderIntervalMs),
+        };
+        _renderCoalesceTimer.Tick += OnRenderTick;
+        _renderCoalesceTimer.Start();
 
         // Cursor blink
         _cursorTimer = new System.Windows.Threading.DispatcherTimer
@@ -384,31 +412,37 @@ public class TerminalControl : FrameworkElement
 
     private void RequestRender(System.Windows.Threading.DispatcherPriority priority = System.Windows.Threading.DispatcherPriority.Render)
     {
-        // Default priority used to be Background, which queued the render
-        // behind unrelated dispatcher work and added perceptible typing lag.
-        // Render runs ahead of Loaded/DataBind/Background, so PTY-driven
-        // redraws hit the screen before the next input event.
+        // priority kept for source compat with existing callers; the
+        // always-on render timer ticks at Render priority anyway.
+        _ = priority;
+
         if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
             return;
 
         if (!_isVisibleSnapshot)
         {
-            // Belongs to a workspace not currently on screen. Skip the
-            // dispatcher round-trip — buffer state is already up to date in
-            // TerminalSession.Buffer; we'll catch up with a single render
-            // when this control becomes visible again.
+            // Workspace not on screen — skip; flushed via OnIsVisibleChanged
+            // when the control becomes visible again.
             Interlocked.Exchange(ref _renderPendingWhileHidden, 1);
             return;
         }
 
-        if (Interlocked.Exchange(ref _renderQueued, 1) == 1)
-            return;
+        // Just mark dirty. The constructor-started timer wakes up at
+        // 16ms cadence on the UI thread and dispatches Render() if
+        // dirty=1. No cross-thread DispatcherTimer state mutation, so
+        // PTY-thread calls are safe and freeze-free.
+        Interlocked.Exchange(ref _renderDirty, 1);
+    }
 
-        Dispatcher.BeginInvoke(() =>
+    private void OnRenderTick(object? sender, EventArgs e)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
         {
-            Interlocked.Exchange(ref _renderQueued, 0);
+            _renderCoalesceTimer?.Stop();
+            return;
+        }
+        if (Interlocked.Exchange(ref _renderDirty, 0) == 1)
             Render();
-        }, priority);
     }
 
     private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
@@ -954,7 +988,15 @@ public class TerminalControl : FrameworkElement
 
     private void SubmitBufferedCommand(bool allowInterception)
     {
-        var rawCommand = _inputLineBuffer.ToString();
+        // Prefer reading the actual visible command line from the
+        // terminal buffer — that captures shell-side Tab completions /
+        // history-recall expansions that the user never typed key-by-key
+        // (e.g., `cd rax_<Tab>` becomes `cd rax_shared/` on screen but the
+        // _inputLineBuffer only sees `cd rax_`). Falls back to the typed
+        // buffer when reading the visible line fails (no session, empty
+        // line, or the prompt prefix can't be located).
+        var bufferLine = TryReadCommandFromBufferLine();
+        var rawCommand = bufferLine ?? _inputLineBuffer.ToString();
         var command = rawCommand.Trim();
         _inputLineBuffer.Clear();
 
@@ -975,6 +1017,80 @@ public class TerminalControl : FrameworkElement
         }
 
         CommandSubmitted?.Invoke(command);
+    }
+
+    /// <summary>
+    /// Reads the visible cursor row from the terminal buffer and tries to
+    /// extract the command portion (everything after the shell prompt).
+    /// Returns null when no session is attached, the line is empty, or
+    /// no recognizable prompt boundary is found — caller falls back to
+    /// the typed input buffer in that case. Captures shell-side Tab
+    /// completion and history recall, which the keystroke-based
+    /// _inputLineBuffer can't see.
+    /// </summary>
+    private string? TryReadCommandFromBufferLine()
+    {
+        if (_session == null) return null;
+        var buffer = _session.Buffer;
+
+        try
+        {
+            var line = buffer.GetLine(buffer.CursorRow);
+            if (line.Length == 0) return null;
+
+            // Take cells up to the cursor column (chars typed beyond the
+            // cursor — e.g. user moved left mid-edit — would be on the
+            // line too, so cap at the cursor for accuracy). Trim trailing
+            // empty cells (rest of line is blank space).
+            int upTo = Math.Min(buffer.CursorCol, line.Length);
+            var sb = new StringBuilder(upTo);
+            for (int i = 0; i < upTo; i++)
+            {
+                var ch = line[i].Character;
+                if (ch == '\0') ch = ' ';
+                sb.Append(ch);
+            }
+            var rendered = sb.ToString().TrimEnd();
+            if (string.IsNullOrEmpty(rendered)) return null;
+
+            // Strip the shell prompt prefix. Common boundaries:
+            //   bash / zsh:  "user@host:dir$ "  or  "...# " for root
+            //   cmd.exe:      "C:\path>"
+            //   PowerShell:   "PS C:\path> "
+            //   fish / heavy themes: vary
+            // Heuristic: find the LAST occurrence of one of these markers
+            // and take everything after. Falls back to the whole line if
+            // no marker is found (rare — caller will then prefer the
+            // typed buffer if both look bad).
+            int idx = LastPromptBoundary(rendered);
+            if (idx < 0) return null;
+            var afterPrompt = rendered[(idx + 1)..].TrimStart();
+            return string.IsNullOrEmpty(afterPrompt) ? null : afterPrompt;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static int LastPromptBoundary(string line)
+    {
+        // Walk right-to-left for the last `$ `, `# `, `> ` (with trailing
+        // space) — these are the canonical end-of-prompt markers across
+        // bash / zsh / cmd / PowerShell. Returns the index of the marker
+        // character; caller takes line[idx+1..].
+        for (int i = line.Length - 2; i >= 0; i--)
+        {
+            char c = line[i];
+            if ((c == '$' || c == '#' || c == '>' || c == '%') && line[i + 1] == ' ')
+                return i + 1;
+        }
+        // cmd.exe prompt has no trailing space after `>`: `C:\path>cmd`.
+        for (int i = line.Length - 1; i >= 0; i--)
+        {
+            if (line[i] == '>') return i;
+        }
+        return -1;
     }
 
     private bool TryInterceptCommand(string command)

@@ -39,6 +39,21 @@ public class CmuxSettings
     public bool ConfirmOnClose { get; set; } = true;
     public bool AutoCopyOnSelect { get; set; } = false;
     public bool CtrlClickOpensUrls { get; set; } = true;
+
+    /// <summary>
+    /// On launch, replay each pane's first captured ssh/mosh/claude
+    /// command (saved in PaneStateSnapshot.AutoRestoreCommand) so the user
+    /// lands back inside the same SSH session / Claude conversation they
+    /// left. Default true — flip off if the auto-replay misfires for a
+    /// custom shell setup.
+    /// </summary>
+    public bool AutoRestorePaneCommands { get; set; } = true;
+    /// <summary>
+    /// When AutoRestorePaneCommands replays `claude` (with no args), append
+    /// `--continue` so Claude Code resumes the most recent conversation
+    /// from disk. Disable to always start a fresh chat on restore.
+    /// </summary>
+    public bool ResumeClaudeOnRestore { get; set; } = true;
     public int AutoSaveIntervalSeconds { get; set; } = 30;
     public bool CaptureTranscriptsOnClose { get; set; } = true;
     public bool CaptureTranscriptsOnClear { get; set; } = true;

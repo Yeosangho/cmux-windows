@@ -19,6 +19,18 @@ public class NotificationService
     public event Action? UnreadCountChanged;
 
     /// <summary>
+    /// UI-thread predicate consulted just before inserting a new
+    /// notification. Returning true drops the item entirely (no list
+    /// entry, no toast, no sound). Wired by App.xaml.cs to suppress
+    /// notifications whose source pane is the currently focused pane in
+    /// a foreground cmuxw window — the user is already looking at it.
+    /// Runs on the UI thread inside the UIMarshal'd Apply so checks
+    /// against UI-thread DependencyProperties (Window.IsActive,
+    /// WindowState) are safe.
+    /// </summary>
+    public Func<TerminalNotification, bool>? ShouldSuppress { get; set; }
+
+    /// <summary>
     /// Marshal callback used to dispatch ObservableCollection mutations and
     /// event firing onto the UI thread. PTY output (which generates OSC
     /// notifications) is processed on a background thread, and a ListBox
@@ -48,7 +60,8 @@ public class NotificationService
         string body,
         NotificationSource source,
         string? senderId = null,
-        DateTime? senderTimestamp = null)
+        DateTime? senderTimestamp = null,
+        bool markRead = false)
     {
         // Composite dedup key: pane + sender id. Without paneId scoping, two
         // panes legitimately emitting the same id (e.g. an `Stop` hook that
@@ -72,7 +85,13 @@ public class NotificationService
                 Subtitle = subtitle,
                 Body = body,
                 Source = source,
-                IsRead = false,
+                // Pre-marked when the caller knows the user is already
+                // looking at the source pane — avoids the race where
+                // AddNotification's UIMarshal queues an unread item and
+                // a follow-up MarkPaneAsRead from the PTY thread runs
+                // before the queued insertion lands, leaving the new
+                // item visibly unread until the next mark.
+                IsRead = markRead,
                 Timestamp = senderTimestamp ?? DateTime.UtcNow,
                 DedupKey = dedupKey,
             };
@@ -84,6 +103,14 @@ public class NotificationService
         // arrive while the panel is showing earlier items.
         void Apply()
         {
+            // ShouldSuppress runs on the UI thread (we're inside Apply,
+            // which itself runs through UIMarshal). Lets App.xaml.cs read
+            // Window.IsActive / WindowState safely. Returning true drops
+            // the item entirely — no list entry, no NotificationAdded
+            // event firing, so no toast/sound. The PTY path is unchanged.
+            if (ShouldSuppress?.Invoke(notification) == true)
+                return;
+
             lock (_lock)
             {
                 _notifications.Insert(0, notification);
@@ -125,6 +152,29 @@ public class NotificationService
                 n.IsRead = true;
         }
         UnreadCountChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Marks every notification originating from <paramref name="paneId"/> as
+    /// read. Called when the user focuses a pane so just-visiting that pane
+    /// clears its unread badge — pane ids are GUIDs and unique app-wide, so
+    /// matching on paneId alone is sufficient.
+    /// </summary>
+    public void MarkPaneAsRead(string? paneId)
+    {
+        if (string.IsNullOrEmpty(paneId)) return;
+
+        bool anyChanged = false;
+        lock (_lock)
+        {
+            foreach (var n in _notifications.Where(n => n.PaneId == paneId && !n.IsRead))
+            {
+                n.IsRead = true;
+                anyChanged = true;
+            }
+        }
+        if (anyChanged)
+            UnreadCountChanged?.Invoke();
     }
 
     /// <summary>

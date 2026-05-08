@@ -117,6 +117,10 @@ public class SessionPersistenceService
             WorkingDirectory = source.WorkingDirectory,
             Shell = source.Shell,
             CommandHistory = source.CommandHistory.ToList(),
+            AutoRestoreCommand = source.AutoRestoreCommand,
+            RemoteWorkingDirectory = source.RemoteWorkingDirectory,
+            ClaudeRunningInside = source.ClaudeRunningInside,
+            ClaudeSessionUuid = source.ClaudeSessionUuid,
             BufferSnapshot = source.BufferSnapshot == null
                 ? null
                 : new Cmux.Core.Terminal.TerminalBufferSnapshot

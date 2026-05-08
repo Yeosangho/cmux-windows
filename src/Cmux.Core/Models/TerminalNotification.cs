@@ -1,3 +1,6 @@
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
 namespace Cmux.Core.Models;
 
 public enum NotificationSource
@@ -8,13 +11,30 @@ public enum NotificationSource
     Cli,
 }
 
-public record TerminalNotification
+public class TerminalNotification : INotifyPropertyChanged
 {
     public string Id { get; init; } = Guid.NewGuid().ToString();
     public required string WorkspaceId { get; init; }
     public required string SurfaceId { get; init; }
     public string? PaneId { get; init; }
-    public bool IsRead { get; set; }
+
+    private bool _isRead;
+    /// <summary>
+    /// Mutable so NotificationService can flip it after the fact, with INPC
+    /// notification so the NotificationPanel ListBox re-evaluates the unread
+    /// dot and the dimmed-row style trigger when a notification is marked read.
+    /// </summary>
+    public bool IsRead
+    {
+        get => _isRead;
+        set
+        {
+            if (_isRead == value) return;
+            _isRead = value;
+            OnPropertyChanged();
+        }
+    }
+
     public required string Title { get; init; }
     public string? Subtitle { get; init; }
     public required string Body { get; init; }
@@ -38,6 +58,11 @@ public record TerminalNotification
     /// didn't supply an id.
     /// </summary>
     public string? DedupKey { get; init; }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 }
 
 public record AppNotification

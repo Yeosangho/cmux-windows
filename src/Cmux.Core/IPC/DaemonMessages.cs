@@ -8,6 +8,15 @@ public static class DaemonMessageTypes
     public const string SessionClose = "SESSION_CLOSE";
     public const string SessionList = "SESSION_LIST";
     public const string SessionSnapshot = "SESSION_SNAPSHOT";
+    /// <summary>
+    /// Walk the daemon-side ConPTY child process tree of a given pane and
+    /// return a classification ("LocalClaude" / "SshSession" / "Unknown").
+    /// Lets the cmuxw broadcast bar's Claude scopes work for daemon-backed
+    /// sessions — without this, cmuxw only sees `null` ProcessId for those
+    /// panes (since the actual ConPTY child lives under cmux-daemon.exe)
+    /// and skips them entirely.
+    /// </summary>
+    public const string SessionClassify = "SESSION_CLASSIFY";
     public const string Ping = "PING";
 
     public const string EventOutput = "OUTPUT";

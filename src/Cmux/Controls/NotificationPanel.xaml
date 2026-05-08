@@ -52,50 +52,98 @@
                      ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                 <ListBox.ItemTemplate>
                     <DataTemplate>
-                        <Border Padding="16,10" BorderBrush="{StaticResource BorderBrush}"
+                        <Border BorderBrush="{StaticResource BorderBrush}"
                                 BorderThickness="0,0,0,1" Cursor="Hand"
-                                Background="Transparent"
                                 MouseLeftButtonUp="NotificationItem_Click">
+                            <Border.Style>
+                                <!-- Read rows get a darker, dimmer background so
+                                     unread vs read is unmistakable at a glance.
+                                     IsRead change relies on TerminalNotification
+                                     implementing INotifyPropertyChanged so the
+                                     trigger re-evaluates after MarkAsRead. -->
+                                <Style TargetType="Border">
+                                    <Setter Property="Background" Value="#10818CF8" />
+                                    <Setter Property="Opacity" Value="1.0" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsRead}" Value="True">
+                                            <Setter Property="Background" Value="Transparent" />
+                                            <Setter Property="Opacity" Value="0.55" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
                             <Grid>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                </Grid.RowDefinitions>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="3" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
 
-                                <!-- Title + unread dot -->
-                                <StackPanel Grid.Row="0" Orientation="Horizontal">
-                                    <Ellipse Width="6" Height="6" Margin="0,0,8,0"
-                                             VerticalAlignment="Center">
-                                        <Ellipse.Style>
-                                            <Style TargetType="Ellipse">
-                                                <Setter Property="Visibility" Value="Collapsed" />
-                                                <Setter Property="Fill" Value="{StaticResource NotificationBrush}" />
-                                                <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding IsRead}" Value="False">
-                                                        <Setter Property="Visibility" Value="Visible" />
-                                                    </DataTrigger>
-                                                </Style.Triggers>
-                                            </Style>
-                                        </Ellipse.Style>
-                                    </Ellipse>
-                                    <TextBlock Text="{Binding Title}"
-                                               Foreground="{StaticResource ForegroundBrush}"
-                                               FontSize="12" FontWeight="SemiBold" />
-                                </StackPanel>
+                                <!-- Left accent bar — visible only on unread -->
+                                <Rectangle Grid.Column="0" Fill="{StaticResource NotificationBrush}">
+                                    <Rectangle.Style>
+                                        <Style TargetType="Rectangle">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsRead}" Value="True">
+                                                    <Setter Property="Visibility" Value="Hidden" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Rectangle.Style>
+                                </Rectangle>
 
-                                <!-- Body -->
-                                <TextBlock Grid.Row="1" Text="{Binding Body}"
-                                           Foreground="{StaticResource ForegroundDimBrush}"
-                                           FontSize="11" Margin="0,4,0,0"
-                                           TextWrapping="Wrap" MaxHeight="44"
-                                           TextTrimming="CharacterEllipsis"
-                                           LineHeight="16" />
+                                <Grid Grid.Column="1" Margin="13,10,16,10">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
 
-                                <!-- Timestamp (local timezone, e.g. KST for Korean users) -->
-                                <TextBlock Grid.Row="2" Text="{Binding LocalTimestamp, StringFormat=HH:mm:ss}"
-                                           Foreground="{StaticResource ForegroundDimBrush}"
-                                           FontSize="10" Margin="0,4,0,0" Opacity="0.6" />
+                                    <!-- Title + unread dot -->
+                                    <StackPanel Grid.Row="0" Orientation="Horizontal">
+                                        <Ellipse Width="6" Height="6" Margin="0,0,8,0"
+                                                 VerticalAlignment="Center">
+                                            <Ellipse.Style>
+                                                <Style TargetType="Ellipse">
+                                                    <Setter Property="Visibility" Value="Visible" />
+                                                    <Setter Property="Fill" Value="{StaticResource NotificationBrush}" />
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding IsRead}" Value="True">
+                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Ellipse.Style>
+                                        </Ellipse>
+                                        <TextBlock Text="{Binding Title}"
+                                                   Foreground="{StaticResource ForegroundBrush}"
+                                                   FontSize="12">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Setter Property="FontWeight" Value="SemiBold" />
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding IsRead}" Value="True">
+                                                            <Setter Property="FontWeight" Value="Normal" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                    </StackPanel>
+
+                                    <!-- Body -->
+                                    <TextBlock Grid.Row="1" Text="{Binding Body}"
+                                               Foreground="{StaticResource ForegroundDimBrush}"
+                                               FontSize="11" Margin="0,4,0,0"
+                                               TextWrapping="Wrap" MaxHeight="44"
+                                               TextTrimming="CharacterEllipsis"
+                                               LineHeight="16" />
+
+                                    <!-- Timestamp (local timezone, e.g. KST for Korean users) -->
+                                    <TextBlock Grid.Row="2" Text="{Binding LocalTimestamp, StringFormat=HH:mm:ss}"
+                                               Foreground="{StaticResource ForegroundDimBrush}"
+                                               FontSize="10" Margin="0,4,0,0" Opacity="0.6" />
+                                </Grid>
                             </Grid>
                         </Border>
                     </DataTemplate>

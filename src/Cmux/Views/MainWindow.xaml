@@ -386,6 +386,7 @@
                         <RowDefinition Height="Auto" /> <!-- Surface tabs -->
                         <RowDefinition Height="Auto" /> <!-- Toolbar -->
                         <RowDefinition Height="*" />    <!-- Terminal / Editor content -->
+                        <RowDefinition Height="Auto" /> <!-- Broadcast input bar -->
                         <RowDefinition Height="Auto" /> <!-- Status bar -->
                     </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
@@ -445,6 +446,11 @@
                                     Click="ToggleAgentChat_Click">
                                 <TextBlock Text="&#xE11B;" FontFamily="Segoe MDL2 Assets" FontSize="12" />
                             </Button>
+                            <Button x:Name="ToolbarBroadcastButton" Style="{StaticResource IconButton}"
+                                    ToolTip="Toggle Broadcast Input (Ctrl+Shift+B)"
+                                    Command="{Binding BroadcastInput.ToggleCommand}">
+                                <TextBlock Text="&#xE95A;" FontFamily="Segoe MDL2 Assets" FontSize="12" />
+                            </Button>
                         </StackPanel>
                     </Border>
 
@@ -474,8 +480,13 @@
                         x:Name="SnippetPickerControl"
                         Visibility="Collapsed" />
 
+                    <!-- Broadcast input bar (Xshell-style multi-session input) -->
+                    <controls:BroadcastInputBar Grid.Row="3" Grid.Column="0"
+                        DataContext="{Binding BroadcastInput}"
+                        Visibility="{Binding IsVisible, Converter={StaticResource BoolToVisibility}}" />
+
                     <!-- Status bar -->
-                    <Border Grid.Row="3" Grid.Column="0" Background="{StaticResource SidebarBackgroundBrush}"
+                    <Border Grid.Row="4" Grid.Column="0" Background="{StaticResource SidebarBackgroundBrush}"
                             BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0"
                             Padding="10,3">
                         <Grid>
@@ -527,7 +538,7 @@
 
                     <!-- Agent chat panel -->
                     <Border x:Name="AgentChatPanel"
-                            Grid.Row="0" Grid.RowSpan="4" Grid.Column="1"
+                            Grid.Row="0" Grid.RowSpan="5" Grid.Column="1"
                             BorderBrush="{StaticResource BorderBrush}" BorderThickness="1,0,0,0"
                             Background="{StaticResource SidebarBackgroundBrush}"
                             Visibility="Collapsed">

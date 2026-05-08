@@ -47,6 +47,11 @@ public partial class MainViewModel : ObservableObject
 
     public NotificationService NotificationService => _notificationService;
 
+    /// <summary>Bottom-of-window broadcast input bar VM. Owned here so the
+    /// menu/toolbar Toggle command and the Ctrl+Shift+B shortcut both act on
+    /// a single shared instance whose pane selection survives across hides.</summary>
+    public BroadcastInputViewModel BroadcastInput { get; }
+
     public MainViewModel()
     {
         _notificationService = App.NotificationService;
@@ -55,6 +60,8 @@ public partial class MainViewModel : ObservableObject
             TotalUnreadCount = _notificationService.UnreadCount;
             UpdateWorkspaceNotificationCounts();
         };
+
+        BroadcastInput = new BroadcastInputViewModel(() => this);
 
         // Wire up the named pipe command handler
         if (App.PipeServer != null)
@@ -131,6 +138,10 @@ public partial class MainViewModel : ObservableObject
                     WorkingDirectory = snapshot.WorkingDirectory,
                     Shell = snapshot.Shell,
                     CommandHistory = snapshot.CommandHistory.ToList(),
+                    AutoRestoreCommand = snapshot.AutoRestoreCommand,
+                    RemoteWorkingDirectory = snapshot.RemoteWorkingDirectory,
+                    ClaudeRunningInside = snapshot.ClaudeRunningInside,
+                    ClaudeSessionUuid = snapshot.ClaudeSessionUuid,
                     BufferSnapshot = snapshot.BufferSnapshot == null
                         ? null
                         : new Cmux.Core.Terminal.TerminalBufferSnapshot
@@ -218,6 +229,13 @@ public partial class MainViewModel : ObservableObject
 
     [RelayCommand]
     public void ToggleAgentPanel() => AgentPanelVisible = !AgentPanelVisible;
+
+    partial void OnSelectedWorkspaceChanged(WorkspaceViewModel? value)
+    {
+        // Refresh the broadcast bar's pane list when switching workspaces so
+        // the "Selected" picker shows the new workspace's panes.
+        BroadcastInput?.RefreshAvailablePanes();
+    }
 
     partial void OnCompactSidebarChanged(bool value)
     {
@@ -362,6 +380,10 @@ public partial class MainViewModel : ObservableObject
                             WorkingDirectory = kvp.Value.WorkingDirectory,
                             Shell = kvp.Value.Shell,
                             CommandHistory = kvp.Value.CommandHistory.ToList(),
+                            AutoRestoreCommand = kvp.Value.AutoRestoreCommand,
+                            RemoteWorkingDirectory = kvp.Value.RemoteWorkingDirectory,
+                            ClaudeRunningInside = kvp.Value.ClaudeRunningInside,
+                            ClaudeSessionUuid = kvp.Value.ClaudeSessionUuid,
                             BufferSnapshot = kvp.Value.BufferSnapshot == null
                                 ? null
                                 : new Cmux.Core.Terminal.TerminalBufferSnapshot

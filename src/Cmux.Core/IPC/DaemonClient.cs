@@ -432,6 +432,25 @@ public sealed class DaemonClient : IDisposable
         return response?.Success == true ? response.Data : null;
     }
 
+    /// <summary>
+    /// Asks the daemon to classify the pane's ConPTY child process tree.
+    /// Returns the kind name as string ("LocalClaude" / "SshSession" /
+    /// "Unknown") — daemon-side <see cref="Cmux.Core.Services.AgentDetector.PaneAgentKind"/>
+    /// stringified. Used by the broadcast bar's Claude scopes so daemon-
+    /// backed panes (where cmuxw's local <c>session.ProcessId</c> is null)
+    /// can still be classified.
+    /// </summary>
+    public async Task<string?> ClassifyPaneAsync(string paneId)
+    {
+        var response = await SendRequestAsync(new DaemonRequest
+        {
+            Type = DaemonMessageTypes.SessionClassify,
+            PaneId = paneId,
+        });
+
+        return response?.Success == true ? response.Data : null;
+    }
+
     public async Task<bool> PingAsync()
     {
         var response = await SendRequestAsync(new DaemonRequest

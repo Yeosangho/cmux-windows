@@ -25,6 +25,18 @@ public partial class App : Application
     public static DaemonClient DaemonClient { get; } = new();
     public static Task<bool> DaemonConnectTask { get; private set; } = Task.FromResult(false);
 
+    /// <summary>
+    /// Volatile mirror of MainWindow.IsActive + WindowState — read from the
+    /// PTY thread (where NotificationReceived events fire) without crossing
+    /// onto the UI thread. Updated from MainWindow's Activated /
+    /// Deactivated / StateChanged events. Used to suppress notifications
+    /// for the focused pane when the user is already looking at it.
+    /// </summary>
+    private static volatile bool _isMainWindowForeground;
+    public static bool IsMainWindowForeground => _isMainWindowForeground;
+    public static void SetMainWindowForeground(bool foreground)
+        => _isMainWindowForeground = foreground;
+
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
@@ -183,19 +195,46 @@ public partial class App : Application
             });
         };
 
-        // Wire up Windows toast notifications.
-        // Skip the toast only when the notification originates from the pane the
-        // user is currently looking at (active workspace + surface + focused pane).
-        // For any other source — different pane, surface, workspace, minimized window,
-        // or a different foreground app — fire the toast.
-        // Also play an in-app system sound on every new notification so the
-        // user gets an audible cue even if Windows toast sound is suppressed
-        // (Focus Assist, per-app silence, etc.).
+        // Hard suppress: drop a notification entirely (no list entry, no
+        // toast, no sound) when the user is already looking at the source
+        // pane in a foreground cmuxw. Conditions match the toast-suppress
+        // rule below — when toast wouldn't fire, the list entry shouldn't
+        // either. Runs on the UI thread (inside NotificationService.Apply
+        // via UIMarshal) so reading UI-thread DependencyProperties is safe.
+        NotificationService.ShouldSuppress = notification =>
+        {
+            var window = Current.MainWindow;
+            if (window is not { IsActive: true, WindowState: not WindowState.Minimized })
+                return false;
+            if (window.DataContext is not ViewModels.MainViewModel vm)
+                return false;
+
+            var ws = vm.SelectedWorkspace;
+            var surface = ws?.SelectedSurface;
+            if (ws == null || surface == null) return false;
+            return string.Equals(ws.Workspace.Id, notification.WorkspaceId, StringComparison.Ordinal)
+                && string.Equals(surface.Surface.Id, notification.SurfaceId, StringComparison.Ordinal)
+                && string.Equals(surface.FocusedPaneId, notification.PaneId, StringComparison.Ordinal);
+        };
+
+        // NotificationAdded only fires for items that pass ShouldSuppress.
+        // Toast skip / sound logic stays here for the "user is looking at
+        // cmuxw but focus is on a sibling control" gray-zone, where we
+        // still want the audible cue + an Action Center entry but maybe
+        // no Windows toast.
         NotificationService.NotificationAdded += notification =>
         {
             var mainWindow = Current.MainWindow;
             var vm = mainWindow?.DataContext as ViewModels.MainViewModel;
 
+            // "Active pane" = cmuxw is the foreground app AND the pane the
+            // notification came from is the workspace/surface's focused
+            // pane. Only this case suppresses toasts — when the user has a
+            // different app focused (browser, IDE, etc.) we fire the toast
+            // so they actually find out something arrived. IsActive is the
+            // discriminator: a visible-but-not-foreground cmuxw could be
+            // off-screen, on another monitor the user isn't looking at,
+            // or behind their browser.
             bool isActivePane = false;
             if (mainWindow is { IsActive: true, WindowState: not WindowState.Minimized } && vm != null)
             {

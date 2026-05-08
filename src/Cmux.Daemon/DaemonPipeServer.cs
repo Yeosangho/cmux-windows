@@ -209,6 +209,7 @@ public sealed class DaemonPipeServer
                 DaemonMessageTypes.SessionClose => HandleSessionClose(request),
                 DaemonMessageTypes.SessionList => HandleSessionList(),
                 DaemonMessageTypes.SessionSnapshot => HandleSessionSnapshot(request),
+                DaemonMessageTypes.SessionClassify => HandleSessionClassify(request),
                 DaemonMessageTypes.Ping => JsonSerializer.Serialize(new DaemonResponse { Success = true, Data = "pong" }),
                 _ => JsonSerializer.Serialize(new DaemonResponse { Success = false, Error = $"Unknown command: {request.Type}" }),
             };
@@ -266,6 +267,25 @@ public sealed class DaemonPipeServer
         if (request.PaneId == null) throw new ArgumentException("PaneId required");
         var snapshot = _sessionManager.GetSnapshot(request.PaneId);
         return JsonSerializer.Serialize(new DaemonResponse { Success = true, Data = snapshot });
+    }
+
+    private string HandleSessionClassify(DaemonRequest request)
+    {
+        if (request.PaneId == null) throw new ArgumentException("PaneId required");
+
+        var session = _sessionManager.GetSession(request.PaneId);
+        var pid = session?.ProcessId ?? 0;
+        // Daemon owns the ConPTY child, so its PID is meaningful here even
+        // though cmuxw sees `null` for the same pane.
+        var kind = pid > 0
+            ? Cmux.Core.Services.AgentDetector.ClassifyPane(pid)
+            : Cmux.Core.Services.AgentDetector.PaneAgentKind.Unknown;
+
+        return JsonSerializer.Serialize(new DaemonResponse
+        {
+            Success = true,
+            Data = kind.ToString(),
+        });
     }
 
     private void BroadcastEvent(DaemonEvent evt)

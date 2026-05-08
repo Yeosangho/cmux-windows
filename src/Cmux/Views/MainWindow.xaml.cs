@@ -41,6 +41,16 @@ public partial class MainWindow : Window
         NotificationPanelControl.NotificationClicked += n => ViewModel.NavigateToNotification(n);
         CommandPaletteControl.ItemExecuted += item => FocusTerminal();
 
+        // Mirror foreground state into App's volatile flag so PTY-thread
+        // notification handlers can suppress entirely (no list entry, no
+        // toast, no sound) when the user is already looking at the source
+        // pane. Snapshotted here instead of probed via Application.Current.MainWindow
+        // because that property is UI-thread-only.
+        Activated += (_, _) => UpdateForegroundFlag();
+        Deactivated += (_, _) => UpdateForegroundFlag();
+        StateChanged += (_, _) => UpdateForegroundFlag();
+        UpdateForegroundFlag();
+
 
         // Wire snippet picker events
         SnippetPickerControl.SnippetSelected += OnSnippetSelected;
@@ -458,6 +468,22 @@ public partial class MainWindow : Window
 
         // === App-level shortcuts that always work, even with terminal focus ===
 
+        // Esc: hide broadcast input bar when visible. Only when keyboard
+        // focus is NOT inside a TerminalControl — otherwise vim / less / etc
+        // would lose their Esc keystrokes the moment the bar is open.
+        // Esc inside the BroadcastInputBar's TextBox is handled by the bar
+        // itself via PreviewKeyDown (closing it before this bubbling
+        // handler runs), so this branch covers the "user clicked elsewhere
+        // (sidebar, button) while the bar is open" case.
+        if (e.Key == Key.Escape && !ctrl && !shift && !alt
+            && ViewModel.BroadcastInput.IsVisible
+            && !IsTerminalFocusActive())
+        {
+            ViewModel.BroadcastInput.Hide();
+            e.Handled = true;
+            return;
+        }
+
         // Ctrl+Tab / Ctrl+Shift+Tab: cycle surfaces
         if (ctrl && e.Key == Key.Tab)
         {
@@ -546,6 +572,10 @@ public partial class MainWindow : Window
                     return;
                 case Key.A: // Toggle agent chat
                     ToggleAgentChat();
+                    e.Handled = true;
+                    return;
+                case Key.B: // Toggle broadcast input bar
+                    ViewModel.BroadcastInput.Toggle();
                     e.Handled = true;
                     return;
             }
@@ -1212,6 +1242,11 @@ public partial class MainWindow : Window
     {
         if (AgentMessagesList.Items.Count > 0)
             AgentMessagesList.ScrollIntoView(AgentMessagesList.Items[AgentMessagesList.Items.Count - 1]);
+    }
+
+    private void UpdateForegroundFlag()
+    {
+        App.SetMainWindowForeground(IsActive && WindowState != WindowState.Minimized);
     }
 
     private static bool IsTerminalFocusActive()
