@@ -49,6 +49,13 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
     /// PaneStateSnapshot.ClaudeSessionUuid; on restore drives
     /// `claude --resume &lt;uuid&gt;` instead of bare `--continue`.</summary>
     private readonly Dictionary<string, string> _paneClaudeUuid = [];
+    /// <summary>Serializes UUID claim-assignment across concurrent
+    /// <see cref="MaybeCaptureClaudeUuid"/> tasks so two panes that type
+    /// `claude` in the same window can't both grab the same JSONL.
+    /// Without this, the global "newest mtime" race assigns each pane
+    /// the UUID of whichever JSONL was last touched at poll time —
+    /// shifting the mapping by one across panes.</summary>
+    private readonly object _claudeUuidClaimLock = new();
     /// <summary>Panes where the user has run `claude` *inside* an SSH
     /// session (i.e. after the AutoRestoreCommand was a bare ssh). Marks
     /// the pane as a "ssh + claude" workflow target for two-stage
@@ -483,32 +490,52 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
 
         _ = Task.Run(async () =>
         {
-            // Claude doesn't always create its JSONL right at TUI launch
-            // — for `claude --continue` it appends to an existing file,
-            // for a fresh session the first write may only happen after
-            // the user's first prompt. Poll a few times so we either
-            // catch the newly-created file (fresh session) or detect
-            // when the existing file's mtime advances past our trigger
-            // (continue / resume session).
+            // Snapshot existing jsonls BEFORE the polling loop so we can
+            // diff against them later. Anything that's new (or whose
+            // mtime advances) after this point is a candidate for THIS
+            // pane's claude. Without this baseline, two panes typing
+            // claude near-simultaneously both pick "the globally
+            // newest" JSONL and end up cross-mapped.
+            var beforeSnapshot = insideSsh
+                ? await SnapshotClaudeJsonlsViaSshAsync(sshHost).ConfigureAwait(false)
+                : SnapshotClaudeJsonlsLocal();
+
             string? uuid = null;
             for (int attempt = 0; attempt < 6 && uuid == null; attempt++)
             {
-                await Task.Delay(2500).ConfigureAwait(false); // 2.5s, 5s, 7.5s, 10s, 12.5s, 15s
+                await Task.Delay(2500).ConfigureAwait(false); // 2.5s … 15s
                 try
                 {
-                    uuid = insideSsh
-                        ? await CaptureClaudeUuidViaSshAsync(sshHost).ConfigureAwait(false)
-                        : CaptureClaudeUuidLocal(capturedAt);
+                    var after = insideSsh
+                        ? await SnapshotClaudeJsonlsViaSshAsync(sshHost).ConfigureAwait(false)
+                        : SnapshotClaudeJsonlsLocal();
+
+                    // Claim under a lock so concurrent pane captures
+                    // can't both pick the same UUID (and so we honor
+                    // already-claimed UUIDs from peer panes).
+                    lock (_claudeUuidClaimLock)
+                    {
+                        var claimed = _paneClaudeUuid.Values.ToHashSet();
+                        var candidate = after
+                            .Where(kv =>
+                                !beforeSnapshot.TryGetValue(kv.Key, out var bm)
+                                || kv.Value > bm)
+                            .Where(kv => !claimed.Contains(kv.Key))
+                            .OrderByDescending(kv => kv.Value)
+                            .Select(kv => kv.Key)
+                            .FirstOrDefault();
+
+                        if (candidate != null)
+                        {
+                            uuid = candidate;
+                            // Claim immediately under the same lock so a
+                            // racing pane's task sees this UUID as taken.
+                            _paneClaudeUuid[paneId] = uuid;
+                        }
+                    }
                 }
                 catch { /* retry on next tick */ }
             }
-
-            if (string.IsNullOrEmpty(uuid)) return;
-
-            System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
-            {
-                _paneClaudeUuid[paneId] = uuid!;
-            }));
         });
     }
 
@@ -519,34 +546,38 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
     /// don't grab an older session's JSONL whose mtime happens to be
     /// fresher because of background interaction.
     /// </summary>
-    private static string? CaptureClaudeUuidLocal(DateTime since)
+    /// <summary>
+    /// Builds a uuid → mtime map of every Claude session JSONL on the
+    /// local machine. Subagent jsonls (nested under <c>subagents/</c>)
+    /// are excluded — those belong to internal helper agents, not the
+    /// parent session we want to track.
+    /// </summary>
+    private static Dictionary<string, DateTime> SnapshotClaudeJsonlsLocal()
     {
+        var map = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         try
         {
             var root = System.IO.Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ".claude", "projects");
-            if (!System.IO.Directory.Exists(root)) return null;
+            if (!System.IO.Directory.Exists(root)) return map;
 
-            // Pick the most-recently-modified JSONL whose mtime is at
-            // least slightly after `since` (when the user typed claude).
-            // Covers both fresh sessions (file created just after) and
-            // claude --continue (file mtime advances on first prompt).
-            // Subagent sub-files live in nested folders — exclude them
-            // so we get the parent session's UUID, not an agent's.
-            var newest = System.IO.Directory.EnumerateFiles(
-                    root, "*.jsonl", System.IO.SearchOption.AllDirectories)
-                .Where(p => !p.Contains(System.IO.Path.DirectorySeparatorChar + "subagents" + System.IO.Path.DirectorySeparatorChar))
-                .Select(p => new System.IO.FileInfo(p))
-                .Where(f => f.LastWriteTimeUtc >= since.AddSeconds(-2))
-                .OrderByDescending(f => f.LastWriteTimeUtc)
-                .FirstOrDefault();
-
-            return newest != null
-                ? System.IO.Path.GetFileNameWithoutExtension(newest.Name)
-                : null;
+            var sep = System.IO.Path.DirectorySeparatorChar;
+            foreach (var path in System.IO.Directory.EnumerateFiles(
+                root, "*.jsonl", System.IO.SearchOption.AllDirectories))
+            {
+                if (path.Contains($"{sep}subagents{sep}")) continue;
+                try
+                {
+                    var fi = new System.IO.FileInfo(path);
+                    var uuid = System.IO.Path.GetFileNameWithoutExtension(fi.Name);
+                    map[uuid] = fi.LastWriteTimeUtc;
+                }
+                catch { }
+            }
         }
-        catch { return null; }
+        catch { }
+        return map;
     }
 
     /// <summary>
@@ -556,17 +587,24 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
     /// — interactive password prompts can't complete here). Stays out
     /// of the pane's primary ssh pipe (which is busy running claude).
     /// </summary>
-    private static async Task<string?> CaptureClaudeUuidViaSshAsync(string? sshHost)
+    /// <summary>
+    /// Out-of-band ssh subprocess listing every <c>~/.claude/projects/&lt;cwd&gt;/*.jsonl</c>
+    /// on the remote with its mtime, returned as a uuid → mtime map. Used
+    /// for snapshot-diff so two near-simultaneous remote claudes can't
+    /// claim each other's UUID. Stays out of the pane's primary ssh
+    /// pipe (which is busy running claude).
+    /// </summary>
+    private static async Task<Dictionary<string, DateTime>> SnapshotClaudeJsonlsViaSshAsync(string? sshHost)
     {
-        if (string.IsNullOrEmpty(sshHost)) return null;
-        // Portable ls -t form — works on bash / zsh / sh / busybox alike.
-        // Earlier GNU-find approach (-newermt / -printf) silently produced
-        // empty output on minimal distros / busybox, leading to UUID
-        // capture quietly failing. The glob expands to all per-project
-        // jsonls one level deep (parent sessions); ls -t sorts by mtime;
-        // head -1 takes the newest. We return the bare basename minus
-        // the .jsonl suffix.
-        var query = "ls -t ~/.claude/projects/*/*.jsonl 2>/dev/null | head -1";
+        var map = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(sshHost)) return map;
+
+        // Portable form: list one-level-deep jsonls + their mtimes (epoch
+        // seconds via stat). bash / zsh / sh / busybox compatible. Output
+        // lines: "<epoch> <full-path>". Empty when no jsonls exist.
+        var query = "for f in ~/.claude/projects/*/*.jsonl; do "
+                  + "  [ -f \"$f\" ] && printf '%s %s\\n' \"$(stat -c %Y \"$f\" 2>/dev/null)\" \"$f\"; "
+                  + "done 2>/dev/null";
 
         var psi = new System.Diagnostics.ProcessStartInfo
         {
@@ -577,28 +615,37 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
             CreateNoWindow = true,
         };
         psi.ArgumentList.Add("-o");
-        psi.ArgumentList.Add("BatchMode=yes"); // never prompt for password
+        psi.ArgumentList.Add("BatchMode=yes");
         psi.ArgumentList.Add(sshHost);
         psi.ArgumentList.Add(query);
 
         try
         {
             using var proc = System.Diagnostics.Process.Start(psi);
-            if (proc == null) return null;
+            if (proc == null) return map;
             var stdout = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
-            await proc.WaitForExitAsync(new CancellationTokenSource(TimeSpan.FromSeconds(15)).Token)
-                       .ConfigureAwait(false);
+            await proc.WaitForExitAsync(
+                new CancellationTokenSource(TimeSpan.FromSeconds(15)).Token)
+                .ConfigureAwait(false);
 
-            var path = stdout.Trim();
-            if (string.IsNullOrEmpty(path)) return null;
-            // Path: /home/.../{...}/<uuid>.jsonl. Extract basename + strip ext.
-            var slash = path.LastIndexOf('/');
-            var baseName = slash >= 0 ? path[(slash + 1)..] : path;
-            if (baseName.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
-                baseName = baseName[..^".jsonl".Length];
-            return string.IsNullOrEmpty(baseName) ? null : baseName;
+            foreach (var raw in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var line = raw.TrimEnd('\r');
+                var sp = line.IndexOf(' ');
+                if (sp <= 0) continue;
+                if (!long.TryParse(line[..sp], out var epoch)) continue;
+                var path = line[(sp + 1)..].Trim();
+                if (path.Contains("/subagents/")) continue;
+                var slash = path.LastIndexOf('/');
+                var baseName = slash >= 0 ? path[(slash + 1)..] : path;
+                if (baseName.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
+                    baseName = baseName[..^".jsonl".Length];
+                if (string.IsNullOrEmpty(baseName)) continue;
+                map[baseName] = DateTimeOffset.FromUnixTimeSeconds(epoch).UtcDateTime;
+            }
         }
-        catch { return null; }
+        catch { }
+        return map;
     }
 
     /// <summary>

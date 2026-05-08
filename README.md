@@ -53,6 +53,35 @@ A dark, keyboard-first terminal multiplexer for Windows, inspired by tmux/cmux w
 - **AttachConsole + CONOUT$ raw write 트랜스포트** — Linux 측 `notify.sh`의 `/proc/<ppid>/fd/1` walk와 등가. notify.ps1이 부모 process chain을 walk해 `cmux-daemon.exe`(또는 `cmuxw.exe`)를 찾고 그 직전 ancestor(ConPTY child PowerShell)에 `AttachConsole`한 뒤 `CreateFileW("CONOUT$")`로 raw UTF-8 OSC 99 byte를 write. hook stdout이 Claude Code에 capture되는 한계, NamedPipe NOTIFY 측 hang, PowerShell `OutputEncoding` cp949로 인한 한국어 깨짐을 모두 회피.
 - 진단 로그는 `%LOCALAPPDATA%\cmux\claude-notify.log`에 기록(시각, msg, transcript, summary, body, transport, 시도한 ancestor pid:name chain).
 
+### 7. 알림 패널 read/unread 시각화 + 활성 pane 자동 무시
+- **`TerminalNotification`을 INPC class로 전환** — `IsRead` 상태 변경이 NotificationPanel 바인딩에 즉시 반영. 좌측 accent bar + 굵은 제목 + dot은 unread 전용, read는 dim/Opacity 0.55.
+- **Pane focus 시 자동 read 처리** — 사용자가 pane을 선택/포커스하는 순간 (`SurfaceViewModel.FocusPane`) 그 paneId의 unread 알림 전부 read. `[ObservableProperty]` partial이 값 unchanged면 fire 안 한다는 점 우회 위해 `FocusPane` 본체에서 직접 호출.
+- **활성 pane은 알림 자체 무발급** — `NotificationService.ShouldSuppress` UI-thread predicate가 (1) `Window.IsActive` (2) `WindowState != Minimized` (3) workspace/surface/paneId 매치 만족 시 list 등록 / toast / 사운드 전부 drop. 다른 앱에 포커스 있거나 다른 pane이 focused면 정상 발사.
+
+### 8. 브로드캐스트 입력 바 (Xshell-style multi-pane send)
+- **하단 입력창** — `Ctrl+Shift+B` 토글 (또는 toolbar 브로드캐스트 아이콘). 입력창 포커스 시 Esc / 창 X로 닫힘.
+- **6개 scope** — 현재 터미널 / 워크스페이스 전체 / 선택한 Panes (직접 체크) / Claude 세션(모두/로컬/SSH).
+- **Daemon-backed pane 분류** — 새 daemon RPC `SESSION_CLASSIFY`. cmuxw가 직접 못 보는 ConPTY 자식 트리를 daemon이 walk해 `LocalClaude` / `SshSession` 반환. AgentDetector.PaneAgentKind 활용.
+- **빨간 링 시각화** — 현재 scope에 의해 broadcast 대상이 되는 모든 pane을 빨간 border로 표시 (Selected scope뿐 아니라 Workspace/Claude 등에서도).
+- **Pane picker 다크 styling + Surface 그룹화** — Aero 기본 ComboBox highlight를 인라인 다크 템플릿으로 override. 선택 popup은 Surface(터미널) 헤더 + 그 아래 pane 체크박스 트리.
+- **자연어 프리셋** — popup 클릭 시 입력창에 자동 채움. 기본 4개 + `%LOCALAPPDATA%\cmux\broadcast-presets.json`로 사용자 정의 가능.
+
+### 9. 세션 Soft Restore + Claude UUID 자동 추적
+- **PaneStateSnapshot 확장** — `AutoRestoreCommand` (첫 ssh/mosh/claude/tmux/screen 명령), `RemoteWorkingDirectory`, `ClaudeRunningInside`, `ClaudeSessionUuid`. 모두 session.json에 영속화.
+- **Cwd 추적은 prompt-parse 기반** — 모든 Enter 키스트로크에 대해 ~500ms 후 cursor 행을 다시 읽어 셸 prompt에서 cwd 추출 (`bash/zsh: user@host:CWD$`, `PowerShell: PS C:\path>`, `cmd: C:\path>`). 셸이 직접 표시하는 cwd가 source of truth라 Tab 완성 / 실패한 cd / drive switch (`D:`) / 상대경로 `..` 모두 자동 처리. SSH 명령은 handshake 대비 추가 3s refresh.
+- **Path-style guard** — Claude TUI 같은 박스 드로잉 영역에서 prompt regex가 false-positive 매치하지 않도록 cwd 후보가 `/`, `~`, 또는 letter+`:` 시작인지 검증.
+- **2-stage 자동 replay** — daemon 종료 / cmuxw 재실행 / PC 재부팅 후, fresh local/daemon 세션이 1단계로 SSH 명령 송신, 4초 후 2단계로 `cd '<remoteCwd>' && claude --resume <uuid>` (또는 `--continue` fallback).
+- **Claude UUID snapshot-diff + claim-aware 캡처** — `claude` 입력 시점에 `~/.claude/projects/**/*.jsonl` 전체 목록을 스냅샷. 2.5초 ×6회 polling으로 신규 또는 mtime 갱신된 파일 검출, 다른 pane이 이미 claim한 UUID는 제외. 동일 cwd / 거의 동시에 띄운 multi-pane도 정확히 매핑. 로컬은 filesystem walk, 원격은 portable `for f in ~/.claude/projects/*/*.jsonl; do printf '%s %s\n' $(stat -c %Y "$f") "$f"; done` over ssh subprocess (BatchMode=yes).
+- **`claude --resume` picker / `claude --resume <uuid>` 모두 처리** — UUID 명시 시 verbatim replay, picker form은 사용자 선택 후 캡처되는 UUID로 다음 복원에 활용. UUID 잡혔을 때 `--continue` / 단독 `--resume`은 모두 `--resume <captured>`로 override.
+
+### 10. 렌더 코얼레서 (Claude 스트리밍 lag 제거)
+- **PTY chunk → Render() 호출이 chunk pace로 풀린던 부담 차단** — Claude 스트리밍(50–200 tok/s) 시 viewport 전체 repaint가 초당 수십 회로 누적되어 UI 스레드를 점유, 입력 latency / "위 스크롤 시 OK / 아래 라이브 시 freeze" 증상 발생.
+- **Always-on `DispatcherTimer` 16ms** — `TerminalControl` 생성자에서 UI 디스패처 명시 바인딩 (`new DispatcherTimer(DispatcherPriority.Render, Dispatcher)`)으로 한 번 만들고 영구 Start. PTY-thread `RequestRender`는 `_renderDirty` flag만 set, dispatcher cross-thread mutation 없음. tick은 dirty=0이면 즉시 반환(Interlocked 한 번).
+- **복구된 pane freeze 수정** — 기존 lazy timer 생성이 PTY reader 스레드에서 처음 호출되어 잘못된 dispatcher에 묶이는 race를 영구 제거.
+
+### 11. Daemon shell 선택 버그 수정
+- cmuxw가 사용자 선택 `DefaultShell` (cmd.exe / pwsh / 등)을 daemon `CreateSessionAsync`에 전달하지 않던 누락 수정. 이전엔 daemon의 자체 `DetectShell()`이 pwsh > powershell > cmd 우선순위로 띄워서 사용자가 cmd로 바꿔도 무시되던 증상.
+
 ---
 
 ## Why / Who / What / How
@@ -221,6 +250,7 @@ Add `publish/cmux-cli` to `PATH` to use `cmux` globally.
 | `Ctrl+Shift+F` | Search overlay |
 | `Ctrl+Shift+L` | Command logs |
 | `Ctrl+Shift+V` | Session vault |
+| `Ctrl+Shift+B` | Broadcast input bar (multi-pane send) |
 | `Ctrl+Alt+H` | Command history picker |
 | `Ctrl+,` | Settings |
 
