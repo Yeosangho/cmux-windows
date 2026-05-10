@@ -578,6 +578,10 @@ public partial class MainWindow : Window
                     ViewModel.BroadcastInput.Toggle();
                     e.Handled = true;
                     return;
+                case Key.S: // Open ~/.ssh/config in external editor
+                    OpenSshConfigInEditor();
+                    e.Handled = true;
+                    return;
             }
         }
 
@@ -1529,6 +1533,54 @@ public partial class MainWindow : Window
     {
         var window = new SessionVaultWindow { Owner = this };
         window.ShowDialog();
+    }
+
+    /// <summary>
+    /// Opens <c>~/.ssh/config</c> in the user's preferred external editor
+    /// (Cursor → VSCode → notepad fallback). Creates the file (and its
+    /// parent .ssh directory) if missing so the editor opens cleanly
+    /// instead of bouncing on a "file not found" error. Useful for quick
+    /// host alias review/edits without leaving cmuxw.
+    /// </summary>
+    private static void OpenSshConfigInEditor()
+    {
+        var sshConfigPath = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".ssh", "config");
+
+        try
+        {
+            var dir = System.IO.Path.GetDirectoryName(sshConfigPath);
+            if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                System.IO.Directory.CreateDirectory(dir);
+            if (!System.IO.File.Exists(sshConfigPath))
+                System.IO.File.WriteAllText(sshConfigPath, "");
+        }
+        catch
+        {
+            // Even if creation failed (permission, etc.) still try to
+            // launch — editor will surface a clearer error than we can.
+        }
+
+        // Try Cursor first (matches the "Open in Cursor" pattern used
+        // for editor folders), then VSCode, then notepad as a guaranteed
+        // fallback. UseShellExecute=true resolves the .cmd shim on PATH.
+        foreach (var editor in new[] { "cursor", "code", "notepad" })
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = editor,
+                    UseShellExecute = true,
+                    CreateNoWindow = true,
+                };
+                psi.ArgumentList.Add(sshConfigPath);
+                using var _ = System.Diagnostics.Process.Start(psi);
+                return;
+            }
+            catch { /* try next editor */ }
+        }
     }
 
     private void OpenCommandHistoryPicker()

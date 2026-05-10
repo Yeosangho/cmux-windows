@@ -251,6 +251,7 @@ Add `publish/cmux-cli` to `PATH` to use `cmux` globally.
 | `Ctrl+Shift+L` | Command logs |
 | `Ctrl+Shift+V` | Session vault |
 | `Ctrl+Shift+B` | Broadcast input bar (multi-pane send) |
+| `Ctrl+Shift+S` | Open `~/.ssh/config` in external editor (Cursor → VSCode → notepad) |
 | `Ctrl+Alt+H` | Command history picker |
 | `Ctrl+,` | Settings |
 
