@@ -38,11 +38,22 @@ public partial class BroadcastInputBar : UserControl
 
     private void InputBox_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter && Keyboard.Modifiers == ModifierKeys.None)
+        // Enter (no modifiers) → submit. Shift+Enter / Ctrl+Enter → let
+        // the TextBox insert a literal newline (AcceptsReturn=true). The
+        // textbox is multi-line so users can compose a multi-line prompt
+        // and fire it once, sidestepping per-keystroke PTY echo lag for
+        // the active pane.
+        if (e.Key == Key.Enter)
         {
-            if (DataContext is BroadcastInputViewModel vm && vm.SubmitCommand.CanExecute(null))
-                vm.SubmitCommand.Execute(null);
-            e.Handled = true;
+            var mods = Keyboard.Modifiers;
+            bool insertNewline = (mods & (ModifierKeys.Shift | ModifierKeys.Control)) != 0;
+            if (!insertNewline)
+            {
+                if (DataContext is BroadcastInputViewModel vm && vm.SubmitCommand.CanExecute(null))
+                    vm.SubmitCommand.Execute(null);
+                e.Handled = true;
+            }
+            // else: TextBox handles Shift+Enter / Ctrl+Enter as a newline
         }
         else if (e.Key == Key.Escape)
         {

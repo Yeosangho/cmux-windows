@@ -11,6 +11,11 @@ namespace Cmux.ViewModels;
 
 public enum BroadcastScope
 {
+    /// <summary>Send to the single currently focused pane of the active
+    /// surface. Lets the user use the broadcast bar as a *low-latency
+    /// prompt composer for the current pane*, sidestepping per-keystroke
+    /// PTY echo lag — the whole composed text is fanned out at once.</summary>
+    ActivePane,
     /// <summary>Send to every pane in the currently selected surface.</summary>
     CurrentSurface,
     /// <summary>Send to every pane across every surface in the current workspace.</summary>
@@ -49,7 +54,7 @@ public partial class BroadcastInputViewModel : ObservableObject
     private bool _isVisible;
 
     [ObservableProperty]
-    private BroadcastScope _scope = BroadcastScope.CurrentSurface;
+    private BroadcastScope _scope = BroadcastScope.ActivePane;
 
     [ObservableProperty]
     private string _text = string.Empty;
@@ -156,13 +161,37 @@ public partial class BroadcastInputViewModel : ObservableObject
         var sessions = ResolveTargetSessions().ToList();
         if (sessions.Count == 0) return;
 
-        // Append CR so the shell submits the line. Match the existing
-        // PANE.WRITE pipe handler's "auto" behaviour (\r) — works for both
-        // cmd.exe and PowerShell on Windows, and bash/zsh on the daemon.
-        var payload = text + "\r";
+        // Normalize CRLF / LF to a single `\n` so multi-line composition
+        // works the same regardless of the user's keyboard or paste source.
+        var normalized = text.Replace("\r\n", "\n");
+        bool isMultiLine = normalized.Contains('\n');
+
         foreach (var session in sessions)
         {
-            try { session.Write(payload); }
+            try
+            {
+                string payload;
+                if (isMultiLine && session.Buffer.BracketedPasteMode)
+                {
+                    // Multi-line + bracketed-paste-aware target (Claude Code
+                    // TUI, modern shells with readline, etc.). Wrapping the
+                    // body in DECSET 2004 brackets tells the receiver "this
+                    // is pasted text — keep newlines as input, don't
+                    // execute each line". Final \r submits.
+                    payload = "\x1b[200~" + normalized + "\x1b[201~\r";
+                }
+                else
+                {
+                    // Single-line OR target without bracketed-paste support.
+                    // Append CR — works for bash/zsh/cmd/PowerShell. For a
+                    // multi-line payload here each \n becomes its own
+                    // shell command (same as pasting into a non-bracketing
+                    // terminal), which is what users on those shells
+                    // already expect.
+                    payload = normalized + "\r";
+                }
+                session.Write(payload);
+            }
             catch { /* one bad session shouldn't block the others */ }
         }
 
@@ -201,6 +230,8 @@ public partial class BroadcastInputViewModel : ObservableObject
 
         return Scope switch
         {
+            BroadcastScope.ActivePane
+                => workspace.SelectedSurface?.FocusedPaneId == paneId,
             BroadcastScope.Selected
                 => SelectedPaneIds.Contains(paneId),
             BroadcastScope.CurrentSurface
@@ -381,6 +412,15 @@ public partial class BroadcastInputViewModel : ObservableObject
 
         switch (Scope)
         {
+            case BroadcastScope.ActivePane:
+                {
+                    var surface = workspace.SelectedSurface;
+                    var paneId = surface?.FocusedPaneId;
+                    if (surface == null || string.IsNullOrEmpty(paneId)) yield break;
+                    var session = surface.GetSession(paneId);
+                    if (session != null) yield return session;
+                    break;
+                }
             case BroadcastScope.CurrentSurface:
                 {
                     var surface = workspace.SelectedSurface;
