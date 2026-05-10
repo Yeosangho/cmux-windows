@@ -29,6 +29,10 @@ public class TerminalControl : FrameworkElement
     private Typeface _typeface;
     private double _cellWidth;
     private double _cellHeight;
+    // Vertical offset from a row's top edge to the font baseline. GlyphRun
+    // takes a baseline origin (not a top-left), so we measure once via a probe
+    // FormattedText("M") to match the layout the rest of the renderer assumes.
+    private double _cellBaseline;
     private double _fontSize;
     private int _cols;
     private int _rows;
@@ -98,6 +102,43 @@ public class TerminalControl : FrameworkElement
     private Typeface? _typefaceBold;
     private Typeface? _typefaceItalic;
     private Typeface? _typefaceBoldItalic;
+
+    // GlyphTypeface caches for the GlyphRun fast path. FormattedText, even
+    // with per-span style overrides, still walks WPF's font fallback chain
+    // and runs full text shaping per construction; for monospace narrow text
+    // both are wasted work because we already know the typeface and the
+    // advance width. GlyphRun lets us blit pre-resolved glyph indices at
+    // pre-known advances, which is ~5–10× cheaper per call. One typeface per
+    // (bold, italic) combo; null until first use, cleared in
+    // InvalidateRenderCaches when font/theme/dpi changes.
+    private GlyphTypeface? _glyphTypefaceRegular;
+    private GlyphTypeface? _glyphTypefaceBold;
+    private GlyphTypeface? _glyphTypefaceItalic;
+    private GlyphTypeface? _glyphTypefaceBoldItalic;
+
+
+    // Render diagnostics. Opt-in via CMUX_RENDER_DIAG=1; off by default so
+    // there's zero hot-path cost in normal builds (one volatile bool check).
+    // Captures Stopwatch ticks per phase + Gen0/1/2 counts over a rolling
+    // 120-frame window, flushed asynchronously to %LOCALAPPDATA%/cmux/
+    // render-diag.log so we can tell whether perceived lag is actually
+    // Render() time or somewhere else (parser feed, IPC, GC pause, …).
+    private static readonly bool RenderDiagEnabled =
+        Environment.GetEnvironmentVariable("CMUX_RENDER_DIAG") == "1";
+    private const int RenderDiagFlushFrames = 120;
+    private static readonly string RenderDiagLogPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "cmux", "render-diag.log");
+    private long _diagSumSetupTicks;
+    private long _diagSumRowsTicks;
+    private long _diagSumOverlayTicks;
+    private long _diagSumTotalTicks;
+    private long _diagMaxTotalTicks;
+    private int _diagFrames;
+    private int _diagGen0AtWindowStart;
+    private int _diagGen1AtWindowStart;
+    private int _diagGen2AtWindowStart;
+    private DateTime _diagWindowStartUtc;
     private readonly StringBuilder _textRunBuffer = new();
     private bool _suppressNextEnterTextInput;
 
@@ -125,6 +166,39 @@ public class TerminalControl : FrameworkElement
         public override int GetHashCode() => HashCode.Combine(Character, FgArgb, Style);
     }
     private readonly Dictionary<WideTextKey, FormattedText> _wideTextCache = [];
+
+    // Per-row narrow-text batching state. Without this, every style run on
+    // every row spawns a fresh FormattedText (which walks WPF's font fallback
+    // chain and runs full text shaping) — a Claude-streamed markdown row
+    // commonly has 5–10 style runs, so Render() was burning ~10k FormattedText
+    // allocations per second under load and saturating the UI thread. With
+    // batching we build the row's text into _textRunBuffer once, record style
+    // boundaries into _rowSpans, then emit a single FormattedText per row and
+    // apply per-range overrides via SetForegroundBrush / SetFontWeight /
+    // SetFontStyle. Wide CJK cells stay on the cached single-cell path for
+    // grid alignment; the row text just leaves two-space placeholders for
+    // their slots so following columns line up.
+    private readonly List<RowStyleSpan> _rowSpans = new();
+
+    private readonly struct RowStyleSpan
+    {
+        public readonly int StartIdx;       // index into row text
+        public readonly int Length;         // length in chars (= cells, since narrow only)
+        public readonly int StartCol;       // grid column for underline/strikethrough x
+        public readonly Color FgColor;
+        public readonly bool Bold;
+        public readonly bool Italic;
+        public readonly bool Dim;
+        public readonly bool Underline;
+        public readonly bool Strikethrough;
+        public RowStyleSpan(int startIdx, int length, int startCol, Color fg,
+            bool bold, bool italic, bool dim, bool ul, bool st)
+        {
+            StartIdx = startIdx; Length = length; StartCol = startCol;
+            FgColor = fg; Bold = bold; Italic = italic; Dim = dim;
+            Underline = ul; Strikethrough = st;
+        }
+    }
 
     // IME preedit (composing text) overlay. Drawn on top of the buffer at
     // the cursor location with an underline, mirroring VSCode/xterm.js's
@@ -233,6 +307,18 @@ public class TerminalControl : FrameworkElement
         // have to touch DispatcherTimer state from the PTY reader thread.
         // Always-on at 16ms; idle ticks just check the dirty flag, which
         // is cheap (one Interlocked.Exchange of 0).
+        //
+        // Priority is Render (= 7), above Input (= 5). When the user types
+        // continuously, KeyDown messages keep arriving at Input priority;
+        // a lower-priority render timer would *starve* — the echo bytes
+        // get into the buffer (PTY thread sets dirty=1) but Render() never
+        // runs because input keeps preempting it, so the user sees typed
+        // characters appear with a delay. Render priority guarantees the
+        // tick runs ahead of input each frame, so each 16ms cycle commits
+        // whatever echoes are in. Trade-off: a single Render() call
+        // (~5–10ms with GlyphRun) defers input by that much. Acceptable
+        // given the alternative is "typed character is invisible until I
+        // stop typing".
         _renderCoalesceTimer = new System.Windows.Threading.DispatcherTimer(
             System.Windows.Threading.DispatcherPriority.Render,
             Dispatcher)
@@ -474,6 +560,7 @@ public class TerminalControl : FrameworkElement
 
         _cellWidth = formattedText.WidthIncludingTrailingWhitespace;
         _cellHeight = formattedText.Height;
+        _cellBaseline = formattedText.Baseline;
     }
 
     private void CalculateTerminalSize()
@@ -517,6 +604,10 @@ public class TerminalControl : FrameworkElement
         _typefaceBold = null;
         _typefaceItalic = null;
         _typefaceBoldItalic = null;
+        _glyphTypefaceRegular = null;
+        _glyphTypefaceBold = null;
+        _glyphTypefaceItalic = null;
+        _glyphTypefaceBoldItalic = null;
         _wideTextCache.Clear();
     }
 
@@ -528,9 +619,41 @@ public class TerminalControl : FrameworkElement
         return _typefaceBoldItalic ??= new Typeface(new FontFamily(_theme.FontFamily), FontStyles.Italic, FontWeights.Bold, FontStretches.Normal);
     }
 
+    /// <summary>
+    /// Resolves the GlyphTypeface for a (bold, italic) variant. Returns null
+    /// when the font family doesn't expose a concrete face (e.g. composite/
+    /// fallback fonts) — callers must fall back to FormattedText in that case.
+    /// Caches per variant, invalidated alongside the regular Typeface caches.
+    /// </summary>
+    private GlyphTypeface? GetGlyphTypeface(bool bold, bool italic)
+    {
+        ref GlyphTypeface? slot = ref _glyphTypefaceRegular;
+        if (bold && !italic) slot = ref _glyphTypefaceBold;
+        else if (!bold && italic) slot = ref _glyphTypefaceItalic;
+        else if (bold && italic) slot = ref _glyphTypefaceBoldItalic;
+
+        if (slot != null) return slot;
+
+        var tf = GetTypeface(bold, italic);
+        if (tf.TryGetGlyphTypeface(out var gtf))
+        {
+            slot = gtf;
+            return gtf;
+        }
+        return null;
+    }
+
     private void Render()
     {
         if (_session == null) return;
+
+        long tStart = 0, tAfterSetup = 0, tAfterRows = 0;
+        if (RenderDiagEnabled)
+        {
+            if (_diagFrames == 0 && _diagWindowStartUtc == default)
+                ResetRenderDiagWindow();
+            tStart = Stopwatch.GetTimestamp();
+        }
 
         try
         {
@@ -576,6 +699,8 @@ public class TerminalControl : FrameworkElement
             var searchMatchBrush = searchMatchSet.Count > 0 ? GetCachedBrush(Color.FromArgb(100, 0xFB, 0xBF, 0x24)) : null;
             var currentMatchBrush = currentMatchSet.Count > 0 ? GetCachedBrush(Color.FromArgb(180, 0xFB, 0x92, 0x3C)) : null;
 
+            if (RenderDiagEnabled) tAfterSetup = Stopwatch.GetTimestamp();
+
             // Render visible rows with batched text
             for (int visRow = 0; visRow < _rows; visRow++)
             {
@@ -589,12 +714,21 @@ public class TerminalControl : FrameworkElement
 
                 double y = visRow * _cellHeight;
 
-                // Text run state for batching
+                // Per-row text + style-span accumulation. The whole row's
+                // narrow text goes into _textRunBuffer (with two-space pads
+                // for wide-cell slots so column alignment is preserved), and
+                // any cell whose style differs from the default starts /
+                // continues / ends a span in _rowSpans. After the inner loop
+                // FlushRowText emits a GlyphRun per span instead of one
+                // FormattedText per style run.
+                _textRunBuffer.Clear();
+                _rowSpans.Clear();
+
+                int runStartIdx = -1;
                 int runStartCol = -1;
                 Color runFgColor = default;
                 bool runBold = false, runItalic = false, runDim = false;
                 bool runUnderline = false, runStrikethrough = false;
-                _textRunBuffer.Clear();
 
                 for (int c = 0; c < _cols; c++)
                 {
@@ -614,7 +748,6 @@ public class TerminalControl : FrameworkElement
                         cell = TerminalCell.Empty;
                     }
 
-                    // Skip continuation cells of wide characters (Width=0)
                     if (cell.Width == 0)
                         continue;
 
@@ -624,7 +757,6 @@ public class TerminalControl : FrameworkElement
                     bool isSelected = _selection.IsSelected(visRow, c);
                     bool isInverse = attr.Flags.HasFlag(CellFlags.Inverse) != isSelected;
 
-                    // Cell colors
                     TerminalColor cellBg, cellFg;
                     if (isInverse)
                     {
@@ -640,14 +772,12 @@ public class TerminalControl : FrameworkElement
                     if (isSelected && _theme.SelectionBackground.HasValue)
                         cellBg = _theme.SelectionBackground.Value;
 
-                    // Draw cell background
                     if (!cellBg.IsDefault)
                     {
                         dc.DrawRectangle(GetCachedBrush(ToWpfColor(cellBg)), null,
                             new Rect(x, y, cellRenderWidth, _cellHeight));
                     }
 
-                    // Search match highlight (behind text)
                     bool isSearchMatch = searchMatchSet.Contains((visRow, c));
                     bool isCurrentMatch = currentMatchSet.Contains((visRow, c));
                     if (isCurrentMatch)
@@ -655,7 +785,6 @@ public class TerminalControl : FrameworkElement
                     else if (isSearchMatch)
                         dc.DrawRectangle(searchMatchBrush, null, new Rect(x, y, cellRenderWidth, _cellHeight));
 
-                    // URL hover highlight
                     if (_hoveredUrl is { } url && visRow == url.row && c >= url.startCol && c <= url.endCol)
                     {
                         var urlPen = new Pen(GetCachedBrush(Color.FromRgb(0x81, 0x8C, 0xF8)), 1);
@@ -663,34 +792,29 @@ public class TerminalControl : FrameworkElement
                         dc.DrawLine(urlPen, new Point(x, y + _cellHeight - 1), new Point(x + cellRenderWidth, y + _cellHeight - 1));
                     }
 
-                    // Text batching: group consecutive NARROW characters with same visual style.
-                    // Wide characters (Width >= 2) are rendered individually at exact grid
-                    // positions to avoid font-metric misalignment.
                     bool hasChar = cell.Character != '\0' && cell.Character != ' ';
                     bool isWide = cell.Width >= 2;
-                    if (hasChar)
+
+                    if (isWide)
                     {
-                        var fgColor = cellFg.IsDefault ? ToWpfColor(_theme.Foreground) : ToWpfColor(cellFg);
-                        bool bold = attr.Flags.HasFlag(CellFlags.Bold);
-                        bool italic = attr.Flags.HasFlag(CellFlags.Italic);
-                        bool dim = attr.Flags.HasFlag(CellFlags.Dim);
-                        bool underline = attr.Flags.HasFlag(CellFlags.Underline);
-                        bool strikethrough = attr.Flags.HasFlag(CellFlags.Strikethrough);
-
-                        if (isWide)
+                        if (runStartIdx >= 0)
                         {
-                            // Flush any pending narrow run before rendering wide char
-                            if (runStartCol >= 0)
-                            {
-                                FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
-                                runStartCol = -1;
-                            }
+                            _rowSpans.Add(new RowStyleSpan(runStartIdx, _textRunBuffer.Length - runStartIdx,
+                                runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough));
+                            runStartIdx = -1;
+                        }
 
-                            // Render wide character individually at exact grid position.
-                            // Cached by (char, fg, style) so subsequent frames skip the
-                            // FormattedText allocation + WPF font fallback chain — that
-                            // chain is the dominant typing-latency source on Hangul-
-                            // dense screens because Latin fonts have no Korean glyphs.
+                        _textRunBuffer.Append("  ");
+
+                        if (hasChar)
+                        {
+                            var fgColor = cellFg.IsDefault ? ToWpfColor(_theme.Foreground) : ToWpfColor(cellFg);
+                            bool bold = attr.Flags.HasFlag(CellFlags.Bold);
+                            bool italic = attr.Flags.HasFlag(CellFlags.Italic);
+                            bool dim = attr.Flags.HasFlag(CellFlags.Dim);
+                            bool underline = attr.Flags.HasFlag(CellFlags.Underline);
+                            bool strikethrough = attr.Flags.HasFlag(CellFlags.Strikethrough);
+
                             var brush = dim
                                 ? GetCachedBrush(Color.FromArgb(128, fgColor.R, fgColor.G, fgColor.B))
                                 : GetCachedBrush(fgColor);
@@ -708,7 +832,6 @@ public class TerminalControl : FrameworkElement
                                     dpi);
                                 _wideTextCache[key] = charText;
                             }
-                            // Center the glyph within the 2-cell space
                             double glyphOffset = (cellRenderWidth - charText.WidthIncludingTrailingWhitespace) / 2;
                             dc.DrawText(charText, new Point(x + Math.Max(0, glyphOffset), y));
 
@@ -725,53 +848,63 @@ public class TerminalControl : FrameworkElement
                                 dc.DrawLine(pen, new Point(x, y + _cellHeight / 2), new Point(x + cellRenderWidth, y + _cellHeight / 2));
                             }
                         }
-                        else
-                        {
-                            // Narrow character — batch into text run
-
-                            // Style changed? Flush the current run first
-                            if (runStartCol >= 0 && (fgColor != runFgColor || bold != runBold ||
-                                italic != runItalic || dim != runDim ||
-                                underline != runUnderline || strikethrough != runStrikethrough))
-                            {
-                                FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
-                                runStartCol = -1;
-                            }
-
-                            // Start new run or continue existing
-                            if (runStartCol < 0)
-                            {
-                                runStartCol = c;
-                                runFgColor = fgColor;
-                                runBold = bold;
-                                runItalic = italic;
-                                runDim = dim;
-                                runUnderline = underline;
-                                runStrikethrough = strikethrough;
-                                _textRunBuffer.Clear();
-                            }
-
-                            _textRunBuffer.Append(cell.Character);
-                        }
                     }
-                    else if (runStartCol >= 0)
+                    else if (hasChar)
                     {
-                        // Empty cell — flush the current run
-                        FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
-                        runStartCol = -1;
+                        var fgColor = cellFg.IsDefault ? ToWpfColor(_theme.Foreground) : ToWpfColor(cellFg);
+                        bool bold = attr.Flags.HasFlag(CellFlags.Bold);
+                        bool italic = attr.Flags.HasFlag(CellFlags.Italic);
+                        bool dim = attr.Flags.HasFlag(CellFlags.Dim);
+                        bool underline = attr.Flags.HasFlag(CellFlags.Underline);
+                        bool strikethrough = attr.Flags.HasFlag(CellFlags.Strikethrough);
+
+                        if (runStartIdx >= 0 && (fgColor != runFgColor || bold != runBold ||
+                            italic != runItalic || dim != runDim ||
+                            underline != runUnderline || strikethrough != runStrikethrough))
+                        {
+                            _rowSpans.Add(new RowStyleSpan(runStartIdx, _textRunBuffer.Length - runStartIdx,
+                                runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough));
+                            runStartIdx = -1;
+                        }
+
+                        if (runStartIdx < 0)
+                        {
+                            runStartIdx = _textRunBuffer.Length;
+                            runStartCol = c;
+                            runFgColor = fgColor;
+                            runBold = bold;
+                            runItalic = italic;
+                            runDim = dim;
+                            runUnderline = underline;
+                            runStrikethrough = strikethrough;
+                        }
+
+                        _textRunBuffer.Append(cell.Character);
+                    }
+                    else
+                    {
+                        if (runStartIdx >= 0)
+                        {
+                            _rowSpans.Add(new RowStyleSpan(runStartIdx, _textRunBuffer.Length - runStartIdx,
+                                runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough));
+                            runStartIdx = -1;
+                        }
+                        _textRunBuffer.Append(' ');
                     }
                 }
 
-                // Flush final run for this row
-                if (runStartCol >= 0)
-                    FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
+                if (runStartIdx >= 0)
+                {
+                    _rowSpans.Add(new RowStyleSpan(runStartIdx, _textRunBuffer.Length - runStartIdx,
+                        runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough));
+                }
+
+                FlushRowText(dc, dpi, y, _textRunBuffer, _rowSpans);
             }
 
-            // IME preedit overlay (composing string). Drawn at the cursor
-            // position with an underline and the terminal foreground color,
-            // covering whatever buffer cells are underneath. Cursor is moved
-            // to the end of the preedit so it sits "after" the composing
-            // text — matching standard text-editor preedit UX.
+            if (RenderDiagEnabled) tAfterRows = Stopwatch.GetTimestamp();
+
+            // IME preedit overlay (composing string).
             int preeditCols = 0;
             if (!isScrolledBack && _preedit.Length > 0)
             {
@@ -788,7 +921,6 @@ public class TerminalControl : FrameworkElement
                 {
                     int w = UnicodeWidth.GetWidth(ch);
                     double cellRender = w >= 2 ? _cellWidth * 2 : _cellWidth;
-                    // Background block to cover any buffer text underneath.
                     dc.DrawRectangle(bgBrush, null, new Rect(pX, pY, cellRender, _cellHeight));
                     var t = new FormattedText(
                         ch.ToString(),
@@ -810,9 +942,7 @@ public class TerminalControl : FrameworkElement
                 }
             }
 
-            // Cursor (only when viewing live buffer). Shifted past any
-            // active preedit so the caret sits where the next typed char
-            // will commit.
+            // Cursor (only when viewing live buffer)
             if (!isScrolledBack && buffer.CursorVisible && IsPaneFocused && (_cursorVisible || !_cursorBlink))
             {
                 double cx = (buffer.CursorCol + preeditCols) * _cellWidth;
@@ -857,6 +987,12 @@ public class TerminalControl : FrameworkElement
                     new Rect(ix, 6, iw, ih), 4, 4);
                 dc.DrawText(indicatorText, new Point(ix + 6, 8));
             }
+
+            if (RenderDiagEnabled)
+            {
+                long tEnd = Stopwatch.GetTimestamp();
+                RecordRenderDiag(tStart, tAfterSetup, tAfterRows, tEnd);
+            }
         }
         catch (Exception ex)
         {
@@ -864,46 +1000,215 @@ public class TerminalControl : FrameworkElement
         }
     }
 
-    /// <summary>
-    /// Draws a batched text run of narrow characters and its decorations
-    /// (underline / strikethrough). Wide CJK characters bypass this and are
-    /// drawn individually at the call site, centered in the 2-cell slot.
-    /// </summary>
-    private void FlushTextRun(DrawingContext dc, double dpi, double y, int startCol,
-        Color fgColor, bool bold, bool italic, bool dim, bool underline, bool strikethrough)
+    private void ResetRenderDiagWindow()
     {
-        if (_textRunBuffer.Length == 0) return;
+        _diagSumSetupTicks = 0;
+        _diagSumRowsTicks = 0;
+        _diagSumOverlayTicks = 0;
+        _diagSumTotalTicks = 0;
+        _diagMaxTotalTicks = 0;
+        _diagFrames = 0;
+        _diagGen0AtWindowStart = GC.CollectionCount(0);
+        _diagGen1AtWindowStart = GC.CollectionCount(1);
+        _diagGen2AtWindowStart = GC.CollectionCount(2);
+        _diagWindowStartUtc = DateTime.UtcNow;
+    }
 
-        var brush = dim
-            ? GetCachedBrush(Color.FromArgb(128, fgColor.R, fgColor.G, fgColor.B))
-            : GetCachedBrush(fgColor);
-        var tf = GetTypeface(bold, italic);
-        var text = new FormattedText(
-            _textRunBuffer.ToString(),
-            CultureInfo.CurrentCulture,
-            FlowDirection.LeftToRight,
-            tf,
-            _fontSize,
-            brush,
-            dpi);
+    private void RecordRenderDiag(long tStart, long tAfterSetup, long tAfterRows, long tEnd)
+    {
+        long setup = tAfterSetup - tStart;
+        long rows = tAfterRows - tAfterSetup;
+        long overlays = tEnd - tAfterRows;
+        long total = tEnd - tStart;
 
-        double x = startCol * _cellWidth;
-        dc.DrawText(text, new Point(x, y));
+        _diagSumSetupTicks += setup;
+        _diagSumRowsTicks += rows;
+        _diagSumOverlayTicks += overlays;
+        _diagSumTotalTicks += total;
+        if (total > _diagMaxTotalTicks) _diagMaxTotalTicks = total;
+        _diagFrames++;
 
-        double runWidth = _textRunBuffer.Length * _cellWidth;
+        if (_diagFrames < RenderDiagFlushFrames) return;
 
-        if (underline)
+        // Snapshot window stats and reset for the next window. We keep the
+        // formatting + file write off the UI thread so render diagnostics
+        // never become their own perf problem (the very thing 909e577 fixed
+        // for ToastNotificationHelper).
+        int frames = _diagFrames;
+        long sumTotal = _diagSumTotalTicks;
+        long sumSetup = _diagSumSetupTicks;
+        long sumRows = _diagSumRowsTicks;
+        long sumOverlays = _diagSumOverlayTicks;
+        long maxTotal = _diagMaxTotalTicks;
+        int gen0 = GC.CollectionCount(0) - _diagGen0AtWindowStart;
+        int gen1 = GC.CollectionCount(1) - _diagGen1AtWindowStart;
+        int gen2 = GC.CollectionCount(2) - _diagGen2AtWindowStart;
+        var windowStart = _diagWindowStartUtc;
+        var windowEnd = DateTime.UtcNow;
+        string paneId = _session?.PaneId ?? "?";
+        int cols = _cols;
+        int rowsCount = _rows;
+        ResetRenderDiagWindow();
+
+        double freq = Stopwatch.Frequency;
+        double avgTotalMs = sumTotal * 1000.0 / freq / frames;
+        double avgSetupMs = sumSetup * 1000.0 / freq / frames;
+        double avgRowsMs = sumRows * 1000.0 / freq / frames;
+        double avgOverlaysMs = sumOverlays * 1000.0 / freq / frames;
+        double maxTotalMs = maxTotal * 1000.0 / freq;
+        double windowSec = (windowEnd - windowStart).TotalSeconds;
+        double rendersPerSec = windowSec > 0 ? frames / windowSec : 0;
+
+        string line =
+            $"{windowEnd:o} pane={paneId} grid={cols}x{rowsCount} " +
+            $"frames={frames} renders/s={rendersPerSec:F1} " +
+            $"avg_total={avgTotalMs:F2}ms max_total={maxTotalMs:F2}ms " +
+            $"avg_setup={avgSetupMs:F2}ms avg_rows={avgRowsMs:F2}ms avg_overlays={avgOverlaysMs:F2}ms " +
+            $"gc0={gen0} gc1={gen1} gc2={gen2}";
+
+        _ = Task.Run(() =>
         {
-            var pen = new Pen(brush, 1);
-            pen.Freeze();
-            dc.DrawLine(pen, new Point(x, y + _cellHeight - 1), new Point(x + runWidth, y + _cellHeight - 1));
-        }
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(RenderDiagLogPath)!);
+                File.AppendAllText(RenderDiagLogPath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[RenderDiag] flush failed: {ex.Message}");
+            }
+        });
+    }
 
-        if (strikethrough)
+    /// <summary>
+    /// Emits each non-default style span as a GlyphRun (low-level glyph blit,
+    /// no font fallback / no shaping — the row's monospace advance is fixed
+    /// at <c>_cellWidth</c>) and draws underline / strikethrough lines for
+    /// spans that need them. Spans between/around styled ranges are spaces
+    /// (placeholders for grid alignment) which have no ink, so we don't draw
+    /// them at all. Wide CJK cells stay on their cached single-cell
+    /// FormattedText path, drawn at the inner-loop call site.
+    /// </summary>
+    private void FlushRowText(DrawingContext dc, double dpi, double y, StringBuilder rowText, List<RowStyleSpan> spans)
+    {
+        if (spans.Count == 0 || rowText.Length == 0) return;
+
+        float pixelsPerDip = (float)dpi;
+        double baselineY = y + _cellBaseline;
+
+        for (int i = 0; i < spans.Count; i++)
         {
-            var pen = new Pen(brush, 1);
-            pen.Freeze();
-            dc.DrawLine(pen, new Point(x, y + _cellHeight / 2), new Point(x + runWidth, y + _cellHeight / 2));
+            var span = spans[i];
+            var brush = span.Dim
+                ? GetCachedBrush(Color.FromArgb(128, span.FgColor.R, span.FgColor.G, span.FgColor.B))
+                : GetCachedBrush(span.FgColor);
+
+            var gtf = GetGlyphTypeface(span.Bold, span.Italic);
+
+            // GlyphRun fast path requires every char in the span to have a
+            // glyph in our monospace GlyphTypeface (no font fallback at
+            // this layer). Three failure modes route the span to the slow
+            // FormattedText path instead, which DOES walk WPF's font-
+            // fallback chain:
+            //
+            //   1. Surrogate pairs — emoji like 😀 (U+1F600) decompose to
+            //      two UTF-16 chars in the buffer, neither of which is a
+            //      valid codepoint by itself.
+            //   2. BMP chars missing from the monospace font — TUI glyphs
+            //      like ⏵ (U+23F5), box-drawing oddballs, etc. Many
+            //      monospace fonts skip these ranges; on a miss, GlyphRun
+            //      would emit glyph 0 (.notdef → empty box) instead of
+            //      letting Windows substitute Segoe UI Symbol / Emoji.
+            //   3. gtf == null (composite font with no concrete face).
+            //
+            // We try to fill the GlyphRun arrays in one pass and bail to
+            // fallback the moment we see a char that can't be resolved.
+            ushort[]? glyphIndices = null;
+            double[]? advanceWidths = null;
+            bool needsFallback = gtf == null;
+            if (gtf != null)
+            {
+                glyphIndices = new ushort[span.Length];
+                advanceWidths = new double[span.Length];
+                var charMap = gtf.CharacterToGlyphMap;
+                for (int j = 0; j < span.Length; j++)
+                {
+                    char ch = rowText[span.StartIdx + j];
+                    if (char.IsSurrogate(ch) || !charMap.TryGetValue(ch, out var idx))
+                    {
+                        needsFallback = true;
+                        break;
+                    }
+                    glyphIndices[j] = idx;
+                    advanceWidths[j] = _cellWidth;
+                }
+            }
+
+            if (!needsFallback)
+            {
+                // Fast path: GlyphRun with pre-resolved glyph indices and
+                // uniform advance widths. We allocate fresh ushort[] /
+                // double[] of exact length per span — WPF GlyphRun reads
+                // these via interface (IList<T>), and an earlier attempt to
+                // pool via a class-based IList<T> wrapper measurably
+                // *regressed* render time on heavier panes (8ms → 13ms),
+                // suggesting WPF has a T[] fast path that the wrapper
+                // bypassed. Per-span alloc is fine given GlyphRun fast path.
+                var run = new GlyphRun(
+                    gtf!,
+                    bidiLevel: 0,
+                    isSideways: false,
+                    renderingEmSize: _fontSize,
+                    pixelsPerDip: pixelsPerDip,
+                    glyphIndices: glyphIndices!,
+                    baselineOrigin: new Point(span.StartCol * _cellWidth, baselineY),
+                    advanceWidths: advanceWidths!,
+                    glyphOffsets: null,
+                    characters: null,
+                    deviceFontName: null,
+                    clusterMap: null,
+                    caretStops: null,
+                    language: null);
+
+                dc.DrawGlyphRun(brush, run);
+            }
+            else
+            {
+                // Composite/fallback font that doesn't expose a concrete
+                // GlyphTypeface — fall back to FormattedText for this span.
+                var tf = GetTypeface(span.Bold, span.Italic);
+                var text = new FormattedText(
+                    rowText.ToString(span.StartIdx, span.Length),
+                    CultureInfo.CurrentCulture,
+                    FlowDirection.LeftToRight,
+                    tf,
+                    _fontSize,
+                    brush,
+                    dpi);
+                dc.DrawText(text, new Point(span.StartCol * _cellWidth, y));
+            }
+
+            // Decorations are separate primitives rather than via
+            // GlyphRun/FormattedText decorations because we want them at
+            // exactly y + _cellHeight - 1 / y + _cellHeight / 2 to match
+            // the grid, not at the font's natural underline metric.
+            if (span.Underline || span.Strikethrough)
+            {
+                double sx = span.StartCol * _cellWidth;
+                double sw = span.Length * _cellWidth;
+                if (span.Underline)
+                {
+                    var pen = new Pen(brush, 1);
+                    pen.Freeze();
+                    dc.DrawLine(pen, new Point(sx, y + _cellHeight - 1), new Point(sx + sw, y + _cellHeight - 1));
+                }
+                if (span.Strikethrough)
+                {
+                    var pen = new Pen(brush, 1);
+                    pen.Freeze();
+                    dc.DrawLine(pen, new Point(sx, y + _cellHeight / 2), new Point(sx + sw, y + _cellHeight / 2));
+                }
+            }
         }
     }
 

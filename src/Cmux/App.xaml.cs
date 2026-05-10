@@ -41,6 +41,16 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // Defer Gen2 GC compaction as long as the runtime can manage it.
+        // SustainedLowLatency tells the GC to prefer growing the heap over
+        // doing blocking compactions that show up as 30–80ms typing-lag
+        // spikes during heavy Claude streaming. Gen0/Gen1 still run as
+        // normal (cheap, sub-ms). Trade-off: working-set may creep upward
+        // over a long session — acceptable for an interactive shell that
+        // is restarted occasionally; if it becomes a real problem we can
+        // schedule a manual GC.Collect() during idle.
+        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
+
         // Add global exception handlers to diagnose crashes
         DispatcherUnhandledException += (s, args) =>
         {

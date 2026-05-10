@@ -79,8 +79,29 @@ public class VtParser
                 _utf8Remaining--;
                 if (_utf8Remaining == 0)
                 {
-                    char c = (char)_utf8Codepoint;
-                    HandlePrint(c);
+                    // BMP codepoint fits in a single UTF-16 char.
+                    // Supplementary plane codepoints (emoji like U+1F600,
+                    // etc.) need to be split into a UTF-16 surrogate pair
+                    // — `(char)_utf8Codepoint` would silently truncate
+                    // the high bits (0x1F600 → 0xF600, a wrong glyph in
+                    // the Private Use Area). Each half is fed through
+                    // HandlePrint so the buffer stores them in two
+                    // adjacent narrow cells, and the renderer's FormattedText
+                    // fallback path stitches them back together via WPF's
+                    // font-fallback chain (Segoe UI Emoji etc.).
+                    if (_utf8Codepoint <= 0xFFFF)
+                    {
+                        HandlePrint((char)_utf8Codepoint);
+                    }
+                    else if (_utf8Codepoint <= 0x10FFFF)
+                    {
+                        int cp = _utf8Codepoint - 0x10000;
+                        char high = (char)(0xD800 | (cp >> 10));
+                        char low = (char)(0xDC00 | (cp & 0x3FF));
+                        HandlePrint(high);
+                        HandlePrint(low);
+                    }
+                    // Codepoints beyond 0x10FFFF are invalid Unicode — drop.
                 }
                 return;
             }
