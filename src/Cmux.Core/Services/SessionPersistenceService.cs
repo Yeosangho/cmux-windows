@@ -10,7 +10,8 @@ namespace Cmux.Core.Services;
 public class SessionPersistenceService
 {
     private static readonly string StateDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "cmux");
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        Cmux.Core.Config.InstanceConfig.StateDirName);
 
     private static readonly string StatePath = Path.Combine(StateDir, "session.json");
 

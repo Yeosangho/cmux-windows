@@ -24,6 +24,22 @@ public static class DaemonMessageTypes
     public const string EventTitleChanged = "TITLE_CHANGED";
     public const string EventCwdChanged = "CWD_CHANGED";
     public const string EventBell = "BELL";
+    /// <summary>OSC 7 carried a non-empty file://host/ authority. Data = hostname.</summary>
+    public const string EventRemoteHost = "REMOTE_HOST";
+    /// <summary>OSC 1338 cmux-agent announce. Data = JSON-encoded AgentAnnouncePayload.</summary>
+    public const string EventAgentAnnounce = "AGENT_ANNOUNCE";
+}
+
+/// <summary>
+/// Wire payload for EventAgentAnnounce. Mirrors the OscHandler 1338 signature.
+/// </summary>
+public class AgentAnnouncePayload
+{
+    public string Agent { get; set; } = "";
+    public string Event { get; set; } = "";
+    public string? Host { get; set; }
+    public string? SessionId { get; set; }
+    public long? TsEpoch { get; set; }
 }
 
 public class DaemonRequest
@@ -54,6 +70,13 @@ public class DaemonSessionInfo
     public bool IsRunning { get; set; }
     /// <summary>True when the session already existed on the daemon (reconnect/attach).</summary>
     public bool IsExisting { get; set; }
+    /// <summary>Last hostname reported via OSC 7 file://host/ authority (null if never).</summary>
+    public string? RemoteHost { get; set; }
+    /// <summary>Currently announced agent id via OSC 1338 ("claude" etc.). Null when no
+    /// announce or after a SessionEnd-style "end" announce.</summary>
+    public string? AnnouncedAgent { get; set; }
+    /// <summary>Unix epoch seconds of the last OSC 1338 announce for staleness GC.</summary>
+    public long? AnnouncedAtEpoch { get; set; }
 }
 
 public class DaemonEvent

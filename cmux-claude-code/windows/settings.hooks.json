@@ -32,5 +32,27 @@
         }
       ]
     }
+  ],
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "powershell -ExecutionPolicy Bypass -NoProfile -File \"<USERPROFILE>\\.claude\\cmux-announce.ps1\" \"start\""
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "powershell -ExecutionPolicy Bypass -NoProfile -File \"<USERPROFILE>\\.claude\\cmux-announce.ps1\" \"end\""
+        }
+      ]
+    }
   ]
 }

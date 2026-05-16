@@ -45,7 +45,16 @@ public sealed class NamedPipeServer : IDisposable
                     PipeDirection.InOut,
                     NamedPipeServerStream.MaxAllowedServerInstances,
                     PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous);
+                    PipeOptions.Asynchronous,
+                    // Explicit in/out buffer sizes. The default-0 zero-copy
+                    // path requires the server to be already blocked on
+                    // Read for client Write to unblock — a race against
+                    // ListenLoop spawning HandleConnection on the thread
+                    // pool. A 4 KB pre-allocated kernel buffer absorbs
+                    // the request immediately so a client connecting
+                    // and writing back-to-back never sees a Write hang.
+                    inBufferSize: 4096,
+                    outBufferSize: 4096);
 
                 await pipe.WaitForConnectionAsync(ct);
 
@@ -70,7 +79,15 @@ public sealed class NamedPipeServer : IDisposable
         {
             using (pipe)
             {
-                using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
+                // detectEncodingFromByteOrderMarks: false — the default
+                // (true) makes the StreamReader ctor probe up to 4 bytes
+                // for a BOM, which on a pipe blocks until either bytes
+                // arrive or the peer closes. We don't emit BOM, so the
+                // probe is dead-weight that adds first-request latency
+                // and hides the actual ReadLineAsync below.
+                using var reader = new StreamReader(pipe, Encoding.UTF8,
+                    detectEncodingFromByteOrderMarks: false, bufferSize: 1024,
+                    leaveOpen: true);
                 using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
 
                 var requestLine = await reader.ReadLineAsync(ct);

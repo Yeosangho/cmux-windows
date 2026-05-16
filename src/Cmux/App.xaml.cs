@@ -91,8 +91,10 @@ public partial class App : Application
             System.Diagnostics.Debug.WriteLine($"[Forwarder] {ex}");
         }
 
-        // Start the named pipe server for CLI communication
-        _pipeServer = new NamedPipeServer();
+        // Start the named pipe server for CLI communication. Isolated test
+        // instances pass CMUX_INSTANCE_ID so they get their own pipe + state
+        // dir and don't collide with a parallel production cmuxw.
+        _pipeServer = new NamedPipeServer(Cmux.Core.Config.InstanceConfig.InstanceId);
         PipeServer = _pipeServer;
         _pipeServer.Start();
 
@@ -363,7 +365,7 @@ public partial class App : Application
         bool existingInstance;
         try
         {
-            using var probe = new NamedPipeClientStream(".", "cmux", PipeDirection.Out);
+            using var probe = new NamedPipeClientStream(".", Cmux.Core.Config.InstanceConfig.AppPipeName, PipeDirection.Out);
             probe.Connect(200);
             existingInstance = probe.IsConnected;
         }
@@ -399,7 +401,7 @@ public partial class App : Application
 
         try
         {
-            using var pipe = new NamedPipeClientStream(".", "cmux", PipeDirection.InOut);
+            using var pipe = new NamedPipeClientStream(".", Cmux.Core.Config.InstanceConfig.AppPipeName, PipeDirection.InOut);
             pipe.Connect(2000);
             using var writer = new StreamWriter(pipe, Encoding.UTF8) { AutoFlush = true };
             using var reader = new StreamReader(pipe, Encoding.UTF8);

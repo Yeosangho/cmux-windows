@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.IO.Pipes;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -10,7 +11,7 @@ namespace Cmux.Daemon;
 
 public sealed class DaemonPipeServer
 {
-    private const string PipeName = "cmux-daemon";
+    private static readonly string PipeName = Cmux.Core.Config.InstanceConfig.DaemonPipeName;
     private readonly DaemonSessionManager _sessionManager;
     // Each client gets a channel for thread-safe event delivery
     private readonly ConcurrentDictionary<string, Channel<string>> _clientChannels = new();
@@ -41,6 +42,27 @@ public sealed class DaemonPipeServer
 
         _sessionManager.CwdChanged += (paneId, dir) =>
             BroadcastEvent(new DaemonEvent { Type = DaemonMessageTypes.EventCwdChanged, PaneId = paneId, Data = dir });
+
+        _sessionManager.RemoteHostChanged += (paneId, host) =>
+            BroadcastEvent(new DaemonEvent { Type = DaemonMessageTypes.EventRemoteHost, PaneId = paneId, Data = host });
+
+        _sessionManager.AgentAnnounced += (paneId, agent, ev, host, sid, tsEpoch) =>
+        {
+            var payload = new AgentAnnouncePayload
+            {
+                Agent = agent,
+                Event = ev,
+                Host = host,
+                SessionId = sid,
+                TsEpoch = tsEpoch,
+            };
+            BroadcastEvent(new DaemonEvent
+            {
+                Type = DaemonMessageTypes.EventAgentAnnounce,
+                PaneId = paneId,
+                Data = JsonSerializer.Serialize(payload),
+            });
+        };
 
         _sessionManager.BellReceived += paneId =>
             BroadcastEvent(new DaemonEvent { Type = DaemonMessageTypes.EventBell, PaneId = paneId });
@@ -275,11 +297,27 @@ public sealed class DaemonPipeServer
 
         var session = _sessionManager.GetSession(request.PaneId);
         var pid = session?.ProcessId ?? 0;
+        var announcedAgent = session?.AnnouncedAgent;
         // Daemon owns the ConPTY child, so its PID is meaningful here even
         // though cmuxw sees `null` for the same pane.
-        var kind = pid > 0
-            ? Cmux.Core.Services.AgentDetector.ClassifyPane(pid)
-            : Cmux.Core.Services.AgentDetector.PaneAgentKind.Unknown;
+        // Capture a buffer snapshot too — lets AgentDetector verify that a
+        // SshSession really is carrying Claude (vs being a bare SSH).
+        string? bufferText = null;
+        if (pid > 0 && session != null)
+        {
+            try
+            {
+                var snap = session.CreateBufferSnapshot(maxScrollbackLines: 500);
+                bufferText = string.Join('\n',
+                    snap.ScrollbackLines.Concat(snap.ScreenLines));
+            }
+            catch { /* snapshot failure is non-fatal — fall through to pid-only classification */ }
+        }
+
+        // pid == 0 fall-through still respects the announce (LocalClaude for
+        // claude announce), so don't short-circuit to Unknown here.
+        var kind = Cmux.Core.Services.AgentDetector.ClassifyPane(
+            pid, bufferText, announcedAgent);
 
         return JsonSerializer.Serialize(new DaemonResponse
         {

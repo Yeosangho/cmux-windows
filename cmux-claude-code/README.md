@@ -1,14 +1,19 @@
-# Claude Code 알림 훅 정리
+# Claude Code 훅 정리
 
-cmux 토스트 알림을 띄우기 위해 Claude Code 측에 설정한 hook과 호출 스크립트 모음.
+cmux 가 Claude Code 세션 lifecycle 을 추적하기 위해 Claude Code 측에 설정한 두 종류의 hook:
+
+1. **알림 hook** (`notify.sh` / OSC 99) — 응답 종료 / 질문 대기 / 입력 요청 이벤트를 cmuxw 토스트로 띄움
+2. **agent announce hook** (`cmux-announce.sh` / OSC 1338) — SessionStart / SessionEnd 에서 "이 pane 안에 Claude 가 살아있다" 라는 결정적 신호를 cmuxw 로 보냄. cmuxw 의 broadcast scope (`ClaudeAll` / `ClaudeSsh`) 분류, pane 상태 추적, 재시작 후 `claude --resume` 복원이 모두 이 신호에 의존.
 
 ## 구성
 
 | 파일 | 역할 |
 |---|---|
-| `~/.claude/settings.json` (해당 부분) | 어떤 이벤트에서 어떤 인자로 `notify.sh`를 부를지 정의 |
-| `~/.claude/notify.sh` | 호출 시 transcript에서 마지막 assistant 텍스트를 추출하고 OSC 99 페이로드를 사용자 PTS로 송신 |
-| `/tmp/claude-notify.log` | 진단용 로그(매 호출마다 fire 시간, transcript 경로, summary, body, 전체 OSC payload의 xxd dump 기록) |
+| `~/.claude/settings.json` (해당 부분) | 어떤 이벤트에서 어떤 hook 스크립트를 부를지 정의 |
+| `~/.claude/notify.sh` | 응답 종료 시 transcript 에서 마지막 assistant 텍스트 추출 → OSC 99 페이로드를 사용자 PTS 로 송신 |
+| `~/.claude/cmux-announce.sh` | SessionStart / SessionEnd 시 OSC 1338 (`cmux-agent=claude;event=start\|end;host=...;sid=...;ts=...`) 페이로드를 PTS 로 송신 |
+| `/tmp/claude-notify.log` | notify.sh 진단 로그 (fire 시간, transcript, summary, OSC payload xxd dump) |
+| `/tmp/cmux-announce.log` | cmux-announce.sh 진단 로그 (fire 시간, event, host, sid, PTS walk) |
 
 ## 동작 흐름
 
@@ -20,21 +25,33 @@ settings.json hook 매칭
         │
         ├─ Stop          → notify.sh "응답 완료"
         ├─ PreToolUse    → notify.sh "질문 대기"   (matcher: AskUserQuestion|ExitPlanMode)
-        └─ Elicitation   → notify.sh "입력 요청"
+        ├─ Elicitation   → notify.sh "입력 요청"
+        ├─ SessionStart  → cmux-announce.sh "start"
+        └─ SessionEnd    → cmux-announce.sh "end"
                 │
                 ▼
-        notify.sh 실행
+        notify.sh / cmux-announce.sh 실행
                 │
                 ├─ stdin JSON 읽기 (transcript_path / session_id)
-                ├─ transcript jsonl 후방 검색으로 마지막 assistant.text 추출
-                ├─ NL/`;`/BEL/ESC 제거 → awk substr로 100자 truncate
-                ├─ BODY = "<basename($PWD)> — <SUMMARY>"
-                ├─ /proc/<ppid 체인>/fd/1 walk로 사용자 PTS 탐색
-                └─ printf '\033]99;t=Claude Code <msg>;b=<BODY>;i=<id>;ts=<ts>\007' → /dev/pts/N
-                        │
+                ├─ (notify.sh) transcript jsonl 후방 검색 → assistant.text 추출 + sanitize
+                ├─ (cmux-announce.sh) hostname + session_id + ts 구성
+                ├─ /proc/<ppid 체인>/fd/1 walk 으로 사용자 PTS 탐색
+                └─ printf '\033]<code>;<payload>\007' → /dev/pts/N
+                        │              │
+                        │              └─ notify.sh : OSC 99  (t=...;b=...;i=...;ts=...)
+                        │                cmux-announce.sh : OSC 1338
+                        │                  (cmux-agent=claude;event=start|end;host=...;pid=...;sid=...;ts=...)
                         ▼
-                cmux PTY 수신 → toast 표시
+                cmux PTY 수신
+                        │
+                        ├─ OSC 99   → NotificationService.AddNotification → toast
+                        └─ OSC 1338 → TerminalSession.AnnouncedAgent set/clear
+                                       → broadcast scope (ClaudeAll/ClaudeSsh) 자동 분류
+                                       → PaneStateSnapshot.ClaudeRunningInside flag
+                                       → AutoRestoreCommand 복원 흐름의 1차 ground truth
 ```
+
+OSC 99 (알림) 와 OSC 1338 (announce) 는 같은 transport (PTS) 를 공유합니다. SSH 안에서 emit 한 경우 양쪽 모두 byte-transparent 로 cmuxw 까지 도달.
 
 ## settings.json (관련 부분)
 
@@ -66,6 +83,22 @@ settings.json hook 매칭
           { "type": "command", "command": "/root/.claude/notify.sh \"입력 요청\"" }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/root/.claude/cmux-announce.sh start" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/root/.claude/cmux-announce.sh end" }
+        ]
+      }
     ]
   }
 }
@@ -73,11 +106,13 @@ settings.json hook 매칭
 
 ### 등록 이벤트와 발화 시점
 
-| 이벤트 | matcher | 발화 시점 | 즉시성 | notify.sh 인자 |
+| 이벤트 | matcher | 발화 시점 | 즉시성 | 호출 hook |
 |---|---|---|---|---|
-| `PreToolUse` | `AskUserQuestion\|ExitPlanMode` | claude가 사용자에게 질문/플랜 승인을 요청하는 도구를 부르기 직전 | 즉시 | `"질문 대기"` |
-| `Stop` | `""` (모든 정지) | claude가 응답을 마치는 시점 | 즉시 | `"응답 완료"` |
-| `Elicitation` | `""` | MCP 서버가 elicitation으로 사용자 입력을 요청 | 즉시 | `"입력 요청"` |
+| `PreToolUse` | `AskUserQuestion\|ExitPlanMode` | claude 가 사용자에게 질문/플랜 승인을 요청하는 도구를 부르기 직전 | 즉시 | `notify.sh "질문 대기"` |
+| `Stop` | `""` (모든 정지) | claude 가 응답을 마치는 시점 | 즉시 | `notify.sh "응답 완료"` |
+| `Elicitation` | `""` | MCP 서버가 elicitation 으로 사용자 입력을 요청 | 즉시 | `notify.sh "입력 요청"` |
+| `SessionStart` | `""` | claude 세션이 시작될 때 (한 번) | 즉시 | `cmux-announce.sh start` |
+| `SessionEnd` | `""` | claude 세션이 정상 종료될 때 (한 번) | 즉시 | `cmux-announce.sh end` |
 
 > 의도적으로 빠진 이벤트:
 > - **`Notification`** (= "입력 대기"): 약 60초 idle 후 발화 → 노이즈 많아 제외.
@@ -172,7 +207,7 @@ exit 1
 | Title 통일 | `Claude Code <msg>` (예: `Claude Code 응답 완료`) | 제목으로 그룹화하면서도 이벤트별로 구분. |
 | ID/TS | `$(date +%s)-$$` / `$(date +%s)` | 매 호출마다 ID가 달라 알림 시스템이 별개의 알림으로 처리. |
 
-## OSC 99 페이로드 형식
+## OSC 99 페이로드 형식 (notify.sh)
 
 ```
 \033]99;t=<TITLE>;b=<BODY>;i=<ID>;ts=<TS>\007
@@ -186,6 +221,76 @@ exit 1
 | `ts` | unix epoch | `1746543738` |
 
 종료자: BEL(`\007`). 일부 멀티플렉서에서는 ST(`\033\\`)가 더 안정적이라는 보고가 있어 필요 시 교체 가능.
+
+## cmux-announce.sh
+
+`~/.claude/cmux-announce.sh` (실행 권한 필수: `chmod +x`):
+
+```bash
+#!/bin/bash
+# Claude Code SessionStart/SessionEnd → cmux 가 이 pane 의 agent 를
+# 결정적으로 식별할 수 있도록 OSC 1338 announce 를 PTS 로 직접 emit.
+
+EVENT="${1:-start}"
+
+HOOK_INPUT=""
+if [ ! -t 0 ]; then
+  HOOK_INPUT=$(timeout 0.3 cat 2>/dev/null)
+fi
+
+SID=""
+if [ -n "$HOOK_INPUT" ] && command -v jq >/dev/null 2>&1; then
+  SID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+fi
+
+HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)
+TS="$(date +%s)"
+
+{
+  pid=$$
+  while [ "$pid" != "0" ] && [ "$pid" != "1" ] && [ -n "$pid" ]; do
+    target=$(readlink "/proc/$pid/fd/1" 2>/dev/null)
+    case "$target" in
+      /dev/pts/*|/dev/tty*)
+        SAFE_EVENT=$(printf '%s' "$EVENT" | tr ';\007\033' '   ')
+        SAFE_HOST=$(printf '%s'  "$HOST"  | tr ';\007\033' '   ')
+        SAFE_SID=$(printf '%s'   "$SID"   | tr ';\007\033' '   ')
+        printf '\033]1338;cmux-agent=claude;event=%s;host=%s;pid=%s;sid=%s;ts=%s\007' \
+          "$SAFE_EVENT" "$SAFE_HOST" "$$" "$SAFE_SID" "$TS" > "$target" 2>/dev/null
+        exit 0
+        ;;
+    esac
+    pid=$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+  done
+} >> /tmp/cmux-announce.log 2>&1
+exit 1
+```
+
+## OSC 1338 페이로드 형식 (cmux-announce.sh)
+
+```
+\033]1338;cmux-agent=<agent>;event=<event>;host=<host>;pid=<pid>;sid=<sid>;ts=<ts>\007
+```
+
+| 키 | 값 | 예시 |
+|---|---|---|
+| `cmux-agent` | agent 식별자 | `claude` |
+| `event` | lifecycle event | `start`, `end`, `heartbeat` |
+| `host` | hostname (short) — 원격에서 emit 됐을 때 host 식별 | `pnode16` |
+| `pid` | hook 스크립트 자체 PID (디버깅용) | `127581` |
+| `sid` | Claude Code session_id (stdin JSON 에서 추출) | `1939e3c0-c8ec-481d-aa00-cba26df8aa5a` |
+| `ts` | unix epoch (emit 시각) | `1746543738` |
+
+cmuxw 측 수신 흐름:
+
+1. `Cmux.Core.Terminal.OscHandler.HandleOsc1338` 가 key=value 파싱
+2. `TerminalSession.AgentAnnounceReceived` 이벤트 발화 + `AnnouncedAgent` / `RemoteHost` / `AnnouncedAt` 상태 업데이트
+3. `event=end` 면 `AnnouncedAgent` 클리어
+4. daemon-backed pane 의 경우 `DaemonSessionManager` → `DaemonPipeServer` → `DaemonClient.AgentAnnounced` 이벤트로 cmuxw 본체에도 broadcast
+5. `BroadcastInputViewModel.InvalidatePane` 가 분류 캐시 무효화 → 다음 broadcast scope 매칭에 즉시 반영
+6. `AgentDetector.ClassifyPane` 가 다음 우선순위로 결정: announce 우선 → process tree (claude.exe / ssh.exe cmdline) → buffer-text 휴리스틱 (low-confidence fallback)
+
+종료자도 BEL(`\007`). OSC 99 와 동일 lex 경로 (VtParser 의 OSC state machine) 를 통과하므로 SSH PTY stream 으로 운반 시 byte-transparent.
 
 ## 진단 / 디버깅
 

@@ -9,12 +9,25 @@ public class OscHandler
 {
     public event Action<string>? TitleChanged;
     public event Action<string>? WorkingDirectoryChanged;
+    // host extracted from OSC 7 file://host/path payload (null when payload is
+    // a plain path with no authority). Emitted *in addition to*
+    // WorkingDirectoryChanged so callers that only need the path stay unchanged.
+    public event Action<string>? RemoteHostReported;
     // title, subtitle, body, id?, timestamp?
     // id and timestamp are non-null only when the sender supplied them via
     // OSC 99's i= / ts= keys. NotificationService uses them for dedup and to
     // record the actual emission time instead of arrival time.
     public event Action<string, string?, string, string?, DateTime?>? NotificationReceived;
     public event Action<char, string?>? ShellPromptMarker;
+    // Agent self-announce from cmux-aware hooks (OSC 1338).
+    // (agent, event, host?, sessionId?, ts?)
+    //   agent     "claude" / "codex" / ...
+    //   event     "start" | "end" | "heartbeat"
+    //   host      hostname the agent is running on (local computer name or
+    //             remote hostname when emitted through SSH)
+    //   sessionId agent-supplied session id (e.g. Claude Code session_id)
+    //   ts        Unix epoch seconds reported by the hook
+    public event Action<string, string, string?, string?, DateTime?>? AgentAnnounceReceived;
 
     /// <summary>
     /// Processes an OSC string (without the ESC ] prefix and BEL/ST terminator).
@@ -83,6 +96,10 @@ public class OscHandler
                     ShellPromptMarker?.Invoke(marker, string.IsNullOrWhiteSpace(markerPayload) ? null : markerPayload);
                 }
                 break;
+
+            case 1338: // cmux agent self-announce
+                HandleOsc1338(payload);
+                break;
         }
     }
 
@@ -94,18 +111,32 @@ public class OscHandler
             try
             {
                 var uri = new Uri(payload);
-                var path = uri.LocalPath;
+                // AbsolutePath preserves the URI's forward-slash form
+                // (Unix path semantics). Uri.LocalPath would map
+                // `file://host/work` to `\\host\work` (UNC) on
+                // Windows, which is wrong for the OSC 7 protocol
+                // — that field always carries the *remote shell's*
+                // notion of cwd, not a Windows file-system path.
+                var path = Uri.UnescapeDataString(uri.AbsolutePath);
+                if (!string.IsNullOrEmpty(uri.Host))
+                    RemoteHostReported?.Invoke(uri.Host);
                 if (!string.IsNullOrEmpty(path))
                     WorkingDirectoryChanged?.Invoke(path);
             }
             catch (UriFormatException)
             {
                 // Try as plain path
-                var path = payload["file://".Length..];
-                int slashIndex = path.IndexOf('/');
+                var rest = payload["file://".Length..];
+                int slashIndex = rest.IndexOf('/');
+                if (slashIndex > 0)
+                {
+                    var host = rest[..slashIndex];
+                    if (!string.IsNullOrEmpty(host))
+                        RemoteHostReported?.Invoke(host);
+                }
                 if (slashIndex >= 0)
                 {
-                    path = path[slashIndex..];
+                    var path = rest[slashIndex..];
                     WorkingDirectoryChanged?.Invoke(path);
                 }
             }
@@ -114,6 +145,49 @@ public class OscHandler
         {
             WorkingDirectoryChanged?.Invoke(payload);
         }
+    }
+
+    /// <summary>
+    /// OSC 1338: cmux agent self-announce. Format:
+    ///   cmux-agent=<id>;event=<start|end|heartbeat>;host=<hostname>;sid=<sessionId>;ts=<epoch>
+    /// Required: cmux-agent + event. Other keys optional.
+    /// </summary>
+    private void HandleOsc1338(string payload)
+    {
+        if (string.IsNullOrEmpty(payload)) return;
+
+        string? agent = null;
+        string? ev = null;
+        string? host = null;
+        string? sid = null;
+        DateTime? ts = null;
+
+        foreach (var pair in payload.Split(';'))
+        {
+            int eq = pair.IndexOf('=');
+            if (eq < 0) continue;
+            var key = pair[..eq].Trim();
+            var value = pair[(eq + 1)..].Trim();
+
+            switch (key)
+            {
+                case "cmux-agent": agent = value; break;
+                case "event": ev = value; break;
+                case "host":
+                    host = string.IsNullOrEmpty(value) ? null : value;
+                    break;
+                case "sid":
+                    sid = string.IsNullOrEmpty(value) ? null : value;
+                    break;
+                case "ts":
+                    if (long.TryParse(value, out var epoch))
+                        ts = DateTimeOffset.FromUnixTimeSeconds(epoch).UtcDateTime;
+                    break;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(agent) && !string.IsNullOrEmpty(ev))
+            AgentAnnounceReceived?.Invoke(agent, ev, host, sid, ts);
     }
 
     /// <summary>

@@ -1,9 +1,11 @@
 using Cmux.Core.IPC;
 using Cmux.Daemon;
 
-// Single-instance check via named mutex
-const string MutexName = "Global\\CmuxDaemon";
-using var mutex = new Mutex(true, MutexName, out bool createdNew);
+// Single-instance check via named mutex. Suffix it with the isolation
+// id (CMUX_INSTANCE_ID) so test instances coexist with the production
+// daemon without one killing the other on startup.
+var mutexName = "Global\\CmuxDaemon" + Cmux.Core.Config.InstanceConfig.Suffix;
+using var mutex = new Mutex(true, mutexName, out bool createdNew);
 if (!createdNew)
 {
     Log("cmux-daemon is already running (mutex exists). Exiting.");

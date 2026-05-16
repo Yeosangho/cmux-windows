@@ -377,20 +377,27 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
         MaybeCaptureAutoRestoreCommand(paneId, sanitized!);
         MaybeCaptureClaudeUuid(paneId, sanitized!);
 
-        // Cwd tracking is driven exclusively by prompt-parsing (the
-        // shell's own cwd display) rather than by parsing the typed
-        // command. Reasons:
-        //   • Tab completion / history recall changes the executed
-        //     text without us seeing the keys.
-        //   • Failed cd (no such directory) leaves cwd alone — we'd
-        //     otherwise corrupt state with the typed argument.
-        //   • Inside TUIs (Claude, vim, fzf), buffer-line capture can
-        //     pull box-drawing UI text that LOOKS like a cd command;
-        //     prompt-parse correctly fails on those (no shell prompt
-        //     visible) and leaves cwd untouched.
-        // Schedule one refresh at 500ms (covers fast cmd / bash). For
-        // ssh/mosh, also schedule a second refresh at 3s to catch the
-        // slow remote handshake → first prompt window.
+        // Cwd tracking strategy:
+        //   1. typed-command parser (TryUpdateCwdFromCdCommand) — primary
+        //      signal. Catches `cd X`, `D:`, `pushd`, `popd`, `chdir`
+        //      immediately on Enter, regardless of shell prompt format,
+        //      OSC 7 availability, or color escapes. Works for SSH cwd
+        //      too (remote-side cd) via `_paneInsideSsh` toggle.
+        //   2. SchedulePromptCwdRefresh (prompt-line regex parse) —
+        //      secondary correction. Re-reads the rendered prompt line
+        //      ~500ms post-Enter to recover from Tab completion /
+        //      history recall / failed cd (no-such-directory) that the
+        //      typed-command parser couldn't see. Only used when its
+        //      result *agrees* with the typed value or when the typed
+        //      parser had no opinion.
+        // Earlier (pre-v107) the comment here claimed prompt-parse was
+        // the *only* signal — that was the source of the "cd doesn't
+        // update in my pane" complaint. Custom PS1, Starship/oh-my-posh,
+        // and unprinted color escapes all break the regex; meanwhile the
+        // typed-command path is deterministic and free.
+        TryUpdateCwdFromCdCommand(paneId, sanitized!);
+        PushCwdToSession(paneId);
+
         SchedulePromptCwdRefresh(paneId, delayMs: 500);
         var firstWord = sanitized!.Trim().Split(' ', 2)[0].ToLowerInvariant();
         if (firstWord is "ssh" or "mosh" or "telnet")
@@ -437,26 +444,17 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
     /// </summary>
     private void MaybeCaptureAutoRestoreCommand(string paneId, string command)
     {
-        var trimmed = command.Trim();
-        var firstWord = trimmed.Split(' ', 2)[0].ToLowerInvariant();
-
-        if (!_paneAutoRestoreCommand.ContainsKey(paneId))
+        var existingPrimary = _paneAutoRestoreCommand.GetValueOrDefault(paneId);
+        var kind = Cmux.Core.Services.PaneCommandTracker.ClassifyAutoRestoreCapture(
+            command, existingPrimary);
+        switch (kind)
         {
-            if (firstWord is "ssh" or "mosh" or "claude" or "tmux" or "screen")
-                _paneAutoRestoreCommand[paneId] = trimmed;
-            return;
-        }
-
-        // Pane already has its primary intent captured (ssh / claude / etc).
-        // If primary was an ssh and the user later types `claude` inside,
-        // mark this pane as a "ssh + claude" workflow target — the
-        // soft-restore second stage will run `claude --continue` for them.
-        var primary = _paneAutoRestoreCommand[paneId];
-        var primaryFirstWord = primary.Split(' ', 2)[0].ToLowerInvariant();
-        if ((primaryFirstWord == "ssh" || primaryFirstWord == "mosh")
-            && firstWord == "claude")
-        {
-            _paneClaudeInsideSsh.Add(paneId);
+            case Cmux.Core.Services.PaneCommandTracker.CaptureKind.CaptureAsPrimary:
+                _paneAutoRestoreCommand[paneId] = command.Trim();
+                break;
+            case Cmux.Core.Services.PaneCommandTracker.CaptureKind.MarkClaudeInsideSsh:
+                _paneClaudeInsideSsh.Add(paneId);
+                break;
         }
     }
 
@@ -743,12 +741,57 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
     /// </summary>
     private void TrackSshState(string paneId, string command)
     {
-        var trimmed = command.Trim();
-        var firstWord = trimmed.Split(' ', 2)[0].ToLowerInvariant();
-        if (firstWord is "ssh" or "mosh")
-            _paneInsideSsh.Add(paneId);
-        else if (firstWord == "exit" || firstWord == "logout")
-            _paneInsideSsh.Remove(paneId);
+        switch (Cmux.Core.Services.PaneCommandTracker.ClassifySshTransition(command))
+        {
+            case Cmux.Core.Services.PaneCommandTracker.SshTransition.Enter:
+                _paneInsideSsh.Add(paneId);
+                break;
+            case Cmux.Core.Services.PaneCommandTracker.SshTransition.Leave:
+                _paneInsideSsh.Remove(paneId);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Mirrors the typed-command-derived cwd into <c>session.WorkingDirectory</c>
+    /// and fires <see cref="WorkingDirectoryChanged"/> so the workspace's
+    /// status bar / pane label refresh immediately on Enter. Without this,
+    /// the typed cwd would live only in <c>_paneLocalCwd</c> / <c>_paneRemoteCwd</c>
+    /// (used for snapshot persistence) but the UI would stay stale until
+    /// the next OSC 7 / daemon CWD_CHANGED arrived — and in environments
+    /// where neither ever fires (cmd.exe, bare PowerShell, busybox over
+    /// ssh) that means never.
+    /// </summary>
+    private void PushCwdToSession(string paneId)
+    {
+        if (!_sessions.TryGetValue(paneId, out var session)) return;
+
+        // Pick the cwd that's actually meaningful for the current pane
+        // state. Inside SSH we expose the remote-side path; outside, the
+        // tracked local cwd.
+        string? cwd;
+        if (_paneInsideSsh.Contains(paneId)
+            && _paneRemoteCwd.TryGetValue(paneId, out var remote)
+            && !string.IsNullOrEmpty(remote))
+        {
+            // Render as a Unix-style absolute path for the UI. Stored form
+            // may be empty (= remote home) or relative-to-home — coerce
+            // to a displayable shape without inventing absolute roots
+            // we don't actually know.
+            cwd = remote.StartsWith('/') ? remote : "~/" + remote;
+        }
+        else
+        {
+            cwd = _paneLocalCwd.GetValueOrDefault(paneId);
+        }
+
+        if (string.IsNullOrEmpty(cwd)) return;
+        if (string.Equals(session.WorkingDirectory, cwd, StringComparison.Ordinal))
+            return;
+
+        session.WorkingDirectory = cwd;
+        if (paneId == FocusedPaneId)
+            WorkingDirectoryChanged?.Invoke(cwd);
     }
 
     private static bool IsLikelyCwdChange(string command)
@@ -915,90 +958,18 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
     /// </summary>
     private void TryUpdateCwdFromCdCommand(string paneId, string command)
     {
-        var trimmed = command.Trim();
-        bool insideSsh = _paneInsideSsh.Contains(paneId);
+        var insideSsh = _paneInsideSsh.Contains(paneId);
+        var priorLocal = _paneLocalCwd.GetValueOrDefault(paneId);
+        var priorRemote = _paneRemoteCwd.GetValueOrDefault(paneId);
+        var fallbackBase = _sessions.GetValueOrDefault(paneId)?.WorkingDirectory;
 
-        // Drive switch in cmd.exe: just `D:` (or `d:`). Switches to the
-        // last accessed dir on that drive — we don't know what that was,
-        // so default to drive root (`D:\`). Subsequent relative cd will
-        // resolve against this.
-        if (!insideSsh && trimmed.Length == 2
-            && char.IsLetter(trimmed[0]) && trimmed[1] == ':')
-        {
-            _paneLocalCwd[paneId] = char.ToUpperInvariant(trimmed[0]) + ":\\";
-            return;
-        }
+        var result = Cmux.Core.Services.CdCommandParser.Parse(
+            command, insideSsh, priorLocal, priorRemote, fallbackBase);
 
-        if (!trimmed.StartsWith("cd ", StringComparison.OrdinalIgnoreCase)
-            && !trimmed.Equals("cd", StringComparison.OrdinalIgnoreCase))
-            return;
-        if (trimmed.Equals("cd", StringComparison.OrdinalIgnoreCase))
-            return; // bare cd → home; can't resolve safely
-
-        var arg = trimmed.Substring(3).Trim();
-
-        // Trim shell chain / redirect tails so `cd /work && claude` is
-        // read as cd /work (target = /work), not cd /work && claude.
-        foreach (var sep in new[] { "&&", "||", ";", "|", ">", "<" })
-        {
-            var idx = arg.IndexOf(sep, StringComparison.Ordinal);
-            if (idx > 0)
-            {
-                arg = arg[..idx].TrimEnd();
-                break;
-            }
-        }
-
-        // Strip surrounding quotes.
-        if (arg.Length >= 2
-            && ((arg[0] == '"' && arg[^1] == '"')
-                || (arg[0] == '\'' && arg[^1] == '\'')))
-            arg = arg[1..^1].Trim();
-        if (string.IsNullOrEmpty(arg)) return;
-        if (arg.StartsWith('~')) return; // remote home; can't resolve safely
-
-        if (insideSsh)
-        {
-            // Combine with any existing remote cwd so sequential relative
-            // cds (cd ysh/rax_shared/, cd ysh, cd ..) accumulate to the
-            // right final path instead of last-wins clobbering. The result
-            // is stored as either an absolute Unix path (`/work/foo`) or
-            // a relative-to-home path (`ysh/foo/bar`). On restore we
-            // replay `cd '<saved>'` from the SSH default cwd; relative
-            // saves land at ~/saved (correct since the user did the same
-            // sequence from ~ originally), absolute land where written.
-            var prior = _paneRemoteCwd.GetValueOrDefault(paneId, "");
-            _paneRemoteCwd[paneId] = CombineUnixPath(prior, arg);
-            return;
-        }
-
-        // Local cd. Resolve to absolute via Path.GetFullPath using the
-        // most recent known local cwd as the base (NOT
-        // session.WorkingDirectory — that's daemon-managed and racy).
-        bool isWindowsAbs = arg.Length >= 3 && char.IsLetter(arg[0])
-                            && arg[1] == ':' && (arg[2] == '\\' || arg[2] == '/');
-
-        string? resolved;
-        if (isWindowsAbs)
-        {
-            try { resolved = System.IO.Path.GetFullPath(arg); }
-            catch { return; }
-        }
-        else
-        {
-            var basePath = _paneLocalCwd.GetValueOrDefault(paneId)
-                           ?? _sessions.GetValueOrDefault(paneId)?.WorkingDirectory
-                           ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            try
-            {
-                resolved = System.IO.Path.GetFullPath(
-                    System.IO.Path.Combine(basePath, arg));
-            }
-            catch { return; }
-        }
-
-        if (!string.IsNullOrEmpty(resolved))
-            _paneLocalCwd[paneId] = resolved;
+        if (!string.IsNullOrEmpty(result.LocalCwd))
+            _paneLocalCwd[paneId] = result.LocalCwd!;
+        if (result.RemoteCwd != null)
+            _paneRemoteCwd[paneId] = result.RemoteCwd;
     }
 
     private static string NormalizeUnixPath(string path)
@@ -1073,49 +1044,15 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
     /// </summary>
     private string TransformAutoRestoreCommand(string command, string paneId)
     {
-        var settings = SettingsService.Current;
-        var trimmed = command.Trim();
-        var firstWord = trimmed.Split(' ', 2)[0].ToLowerInvariant();
-
-        // SSH commands replay verbatim — no tmux wrap. Soft restore (replay
-        // ssh + cd remote + claude --resume / --continue) covers the typical
-        // workflow without remote-side dependencies or session pile-up.
-
-        if (firstWord == "claude" && settings.ResumeClaudeOnRestore)
-        {
-            // Explicit --resume <uuid>: user pinned a specific session.
-            // Always leaves verbatim — captured UUID would just match
-            // it anyway, and we never want to clobber an explicit pin.
-            if (HasExplicitResumeUuid(trimmed)) return trimmed;
-
-            // Captured UUID overrides anything else (bare claude,
-            // --continue, or picker-form --resume). The captured UUID
-            // is more deterministic than --continue when multiple
-            // parallel sessions live in the same cwd.
-            if (_paneClaudeUuid.TryGetValue(paneId, out var uuid)
-                && !string.IsNullOrEmpty(uuid))
-            {
-                // Drop any --continue / -c / standalone --resume so we
-                // don't emit conflicting flags.
-                var cleaned = StripStandaloneResumeFlag(trimmed);
-                return $"{cleaned} --resume {uuid}";
-            }
-
-            // No UUID captured.
-            // - --continue / -c: keep, claude resumes most recent in cwd.
-            // - --resume (picker): keep, claude shows session list.
-            // - bare claude: append --continue as a soft default.
-            bool hasContinue = trimmed.Contains("--continue")
-                               || System.Text.RegularExpressions.Regex.IsMatch(
-                                   trimmed, @"(\s|^)-c(\s|$)");
-            bool hasResumeFlag = trimmed.Contains("--resume")
-                                 || System.Text.RegularExpressions.Regex.IsMatch(
-                                     trimmed, @"(\s|^)-r(\s|$)");
-            if (hasContinue || hasResumeFlag) return trimmed;
-            return $"{trimmed} --continue";
-        }
-
-        return trimmed;
+        // Delegates to Cmux.Core's pure transformer so the decision logic
+        // is unit-testable without the WPF dependency stack. SurfaceViewModel
+        // just supplies the runtime context (the captured UUID from
+        // _paneClaudeUuid and the SettingsService flag).
+        var capturedUuid = _paneClaudeUuid.GetValueOrDefault(paneId);
+        return Cmux.Core.Services.AutoRestoreCommandTransformer.Transform(
+            command,
+            capturedUuid,
+            SettingsService.Current.ResumeClaudeOnRestore);
     }
 
     /// <summary>
@@ -1215,6 +1152,20 @@ public partial class SurfaceViewModel : ObservableObject, IDisposable
         var effectiveShell = shell ?? GetConfiguredShell();
         // Store the explicit override (null = use default shell from settings)
         _paneShells[paneId] = shell;
+
+        // Seed the local-cwd tracker with the ConPTY's start directory so
+        // a brand-new pane has a meaningful cwd *before* the user types
+        // anything. Skip when the seed value looks remote (Unix path
+        // restored from an ssh-rooted snapshot) — that lives in
+        // _paneRemoteCwd, not _paneLocalCwd. Don't overwrite an existing
+        // tracked value (could be a restored snapshot path).
+        var seedCwd = workingDirectory ?? restoredState?.WorkingDirectory;
+        if (!string.IsNullOrWhiteSpace(seedCwd)
+            && !LooksLikeRemoteCwd(seedCwd)
+            && !_paneLocalCwd.ContainsKey(paneId))
+        {
+            _paneLocalCwd[paneId] = seedCwd!;
+        }
 
         // Wait for daemon connect task (includes starting daemon if needed).
         // First pane blocks up to 5s; subsequent panes get the cached result instantly.

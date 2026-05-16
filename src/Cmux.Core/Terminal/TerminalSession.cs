@@ -40,6 +40,16 @@ public sealed class TerminalSession : IDisposable
     public string PaneId { get; }
     public string? Title { get; private set; }
     public string? WorkingDirectory { get; set; }
+    // Last OSC 7 host / OSC 1338 host. For local panes this stays null (OSC 7
+    // is mainly emitted by Linux/macOS shells; Windows shells don't by default).
+    // For SSH panes this is the remote hostname reported by the remote shell.
+    public string? RemoteHost { get; private set; }
+    // Agent currently announced as running inside this pane (e.g. "claude").
+    // Set on OSC 1338 "start", cleared on "end". Authoritative when present —
+    // primary signal for AgentDetector classification. Null falls back to
+    // process-tree / ssh-cmdline heuristics.
+    public string? AnnouncedAgent { get; private set; }
+    public DateTime? AnnouncedAt { get; private set; }
     public bool IsRunning => _process != null && !_process.HasExited;
     public int? ProcessId => _process?.ProcessId;
 
@@ -52,6 +62,11 @@ public sealed class TerminalSession : IDisposable
     public event Action? ProcessExited;
     public event Action<string>? TitleChanged;
     public event Action<string>? WorkingDirectoryChanged;
+    // Forwarded from OscHandler when OSC 7 carries a non-empty file://host/ authority.
+    public event Action<string>? RemoteHostReported;
+    // Forwarded from OscHandler when an OSC 1338 cmux-agent announce arrives.
+    // (agent, event, host?, sessionId?, ts?)
+    public event Action<string, string, string?, string?, DateTime?>? AgentAnnounceReceived;
     // title, subtitle, body, sender-supplied id (or null), sender-supplied timestamp (or null)
     public event Action<string, string?, string, string?, DateTime?>? NotificationReceived;
     public event Action<char, string?>? ShellPromptMarker;
@@ -146,6 +161,12 @@ public sealed class TerminalSession : IDisposable
             WorkingDirectoryChanged?.Invoke(dir);
         };
 
+        _oscHandler.RemoteHostReported += host =>
+        {
+            RemoteHost = host;
+            RemoteHostReported?.Invoke(host);
+        };
+
         _oscHandler.NotificationReceived += (title, subtitle, body, id, ts) =>
         {
             NotificationReceived?.Invoke(title, subtitle, body, id, ts);
@@ -154,6 +175,25 @@ public sealed class TerminalSession : IDisposable
         _oscHandler.ShellPromptMarker += (marker, payload) =>
         {
             ShellPromptMarker?.Invoke(marker, payload);
+        };
+
+        _oscHandler.AgentAnnounceReceived += (agent, ev, host, sid, ts) =>
+        {
+            // "start" sets the announced agent; "end" clears it.
+            // Heartbeats refresh the timestamp without touching agent identity.
+            if (string.Equals(ev, "end", StringComparison.OrdinalIgnoreCase))
+            {
+                AnnouncedAgent = null;
+                AnnouncedAt = ts ?? DateTime.UtcNow;
+            }
+            else
+            {
+                AnnouncedAgent = agent;
+                AnnouncedAt = ts ?? DateTime.UtcNow;
+                if (!string.IsNullOrEmpty(host))
+                    RemoteHost = host;
+            }
+            AgentAnnounceReceived?.Invoke(agent, ev, host, sid, ts);
         };
     }
 

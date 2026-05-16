@@ -31,5 +31,27 @@
         }
       ]
     }
+  ],
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/root/.claude/cmux-announce.sh start"
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/root/.claude/cmux-announce.sh end"
+        }
+      ]
+    }
   ]
 }

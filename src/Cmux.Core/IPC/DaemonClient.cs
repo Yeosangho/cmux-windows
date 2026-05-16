@@ -7,7 +7,7 @@ namespace Cmux.Core.IPC;
 
 public sealed class DaemonClient : IDisposable
 {
-    private const string PipeName = "cmux-daemon";
+    private static readonly string PipeName = Cmux.Core.Config.InstanceConfig.DaemonPipeName;
     private NamedPipeClientStream? _pipe;
     private StreamReader? _reader;
     private volatile bool _connected; // set after pipe + reader are ready
@@ -24,6 +24,9 @@ public sealed class DaemonClient : IDisposable
     public event Action<string, int>? SessionExited;          // paneId, exitCode
     public event Action<string, string>? TitleChanged;        // paneId, title
     public event Action<string, string>? CwdChanged;          // paneId, directory
+    public event Action<string, string>? RemoteHostChanged;   // paneId, remote hostname (OSC 7)
+    // paneId, agent, event, host?, sessionId?, tsEpoch?
+    public event Action<string, string, string, string?, string?, long?>? AgentAnnounced;
     public event Action<string>? BellReceived;                // paneId
     public event Action? Connected;
     public event Action? Disconnected;
@@ -272,6 +275,23 @@ public sealed class DaemonClient : IDisposable
                 if (evt.PaneId != null && evt.Data != null)
                     CwdChanged?.Invoke(evt.PaneId, evt.Data);
                 break;
+            case DaemonMessageTypes.EventRemoteHost:
+                if (evt.PaneId != null && !string.IsNullOrEmpty(evt.Data))
+                    RemoteHostChanged?.Invoke(evt.PaneId, evt.Data);
+                break;
+            case DaemonMessageTypes.EventAgentAnnounce:
+                if (evt.PaneId != null && !string.IsNullOrEmpty(evt.Data))
+                {
+                    try
+                    {
+                        var payload = JsonSerializer.Deserialize<AgentAnnouncePayload>(evt.Data);
+                        if (payload != null && !string.IsNullOrEmpty(payload.Agent) && !string.IsNullOrEmpty(payload.Event))
+                            AgentAnnounced?.Invoke(evt.PaneId, payload.Agent, payload.Event,
+                                payload.Host, payload.SessionId, payload.TsEpoch);
+                    }
+                    catch { }
+                }
+                break;
             case DaemonMessageTypes.EventBell:
                 if (evt.PaneId != null)
                     BellReceived?.Invoke(evt.PaneId);
@@ -345,7 +365,8 @@ public sealed class DaemonClient : IDisposable
         try
         {
             var logDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "cmux");
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                Cmux.Core.Config.InstanceConfig.StateDirName);
             Directory.CreateDirectory(logDir);
             var logPath = Path.Combine(logDir, "daemon-debug.log");
             // Use FileShare.ReadWrite so daemon and client can write concurrently

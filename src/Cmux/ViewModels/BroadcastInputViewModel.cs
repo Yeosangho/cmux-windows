@@ -95,11 +95,54 @@ public partial class BroadcastInputViewModel : ObservableObject
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "cmux", "broadcast-presets.json");
 
+    // In-memory shell-style prompt history. Each Submit appends Text here
+    // (deduplicating consecutive duplicates). The view binds Up/Down at the
+    // top/bottom caret line into TryNavigateHistory{Up,Down} so the user
+    // can recall and re-fire a previous broadcast prompt without retyping.
+    private readonly List<string> _history = new();
+    private int _historyIndex = -1;  // -1 = not currently navigating; otherwise 0=newest, 1=older, ...
+    private string _historyDraft = string.Empty;  // saved on entry into navigation, restored at the newest edge
+    private const int HistoryCap = 200;
+
     public BroadcastInputViewModel(Func<MainViewModel?> mainResolver)
     {
         _mainResolver = mainResolver;
         LoadPresets();
         RefreshTargetSummary();
+
+        // OSC 1338 announce / OSC 7 host arriving on the wire is *new* state
+        // that invalidates whatever classification we already cached for that
+        // pane. The cleanest reaction is to drop the cache entry and rerun
+        // MaybeStartKindRefresh — if the bar is visible & on a Claude scope
+        // the visualization repaints in the next tick; otherwise the next
+        // OnIsVisibleChanged / OnScopeChanged will pick it up naturally.
+        var daemon = App.DaemonClient;
+        daemon.AgentAnnounced += (paneId, agent, ev, host, sid, tsEpoch) =>
+            InvalidatePane(paneId);
+        daemon.RemoteHostChanged += (paneId, host) =>
+            InvalidatePane(paneId);
+    }
+
+    /// <summary>
+    /// Drops any cached classification for <paramref name="paneId"/> and (if
+    /// the broadcast bar is currently driving a Claude scope) schedules a
+    /// background refresh so the visualization stays current. Public so
+    /// SurfaceViewModel's local-side OSC wire can call it for in-process
+    /// (non-daemon) sessions.
+    /// </summary>
+    public void InvalidatePane(string paneId)
+    {
+        Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
+        {
+            _kindCache.Remove(paneId);
+            if (IsVisible &&
+                (Scope == BroadcastScope.ClaudeLocal
+                 || Scope == BroadcastScope.ClaudeSsh
+                 || Scope == BroadcastScope.ClaudeAll))
+            {
+                MaybeStartKindRefresh();
+            }
+        }));
     }
 
     [RelayCommand]
@@ -153,7 +196,7 @@ public partial class BroadcastInputViewModel : ObservableObject
     public void Hide() => IsVisible = false;
 
     [RelayCommand]
-    public void Submit()
+    public async Task Submit()
     {
         var text = Text;
         if (string.IsNullOrEmpty(text)) return;
@@ -166,6 +209,16 @@ public partial class BroadcastInputViewModel : ObservableObject
         var normalized = text.Replace("\r\n", "\n");
         bool isMultiLine = normalized.Contains('\n');
 
+        // Stage 1: send the body only (no trailing \r). When the target is
+        // a multi-line TUI like Claude Code that's already mid-edit (the
+        // user typed something in the pane before broadcasting), a single
+        // write that ends in `…\x1b[201~\r` or `…text\r` can have its
+        // trailing `\r` swallowed by the input handler while it's still
+        // finalizing the paste-end / input buffer — the symptom users
+        // see is "broadcast arrives but doesn't submit; I have to press
+        // Enter manually in the Claude Code pane". Splitting body and
+        // Enter into two writes with a short gap makes the Enter arrive
+        // as a fresh, unambiguous keystroke.
         foreach (var session in sessions)
         {
             try
@@ -177,25 +230,120 @@ public partial class BroadcastInputViewModel : ObservableObject
                     // TUI, modern shells with readline, etc.). Wrapping the
                     // body in DECSET 2004 brackets tells the receiver "this
                     // is pasted text — keep newlines as input, don't
-                    // execute each line". Final \r submits.
-                    payload = "\x1b[200~" + normalized + "\x1b[201~\r";
+                    // execute each line".
+                    payload = "\x1b[200~" + normalized + "\x1b[201~";
                 }
                 else
                 {
                     // Single-line OR target without bracketed-paste support.
-                    // Append CR — works for bash/zsh/cmd/PowerShell. For a
-                    // multi-line payload here each \n becomes its own
+                    // For a multi-line payload here each \n becomes its own
                     // shell command (same as pasting into a non-bracketing
                     // terminal), which is what users on those shells
                     // already expect.
-                    payload = normalized + "\r";
+                    payload = normalized;
                 }
                 session.Write(payload);
             }
             catch { /* one bad session shouldn't block the others */ }
         }
 
-        Text = string.Empty;
+        // Append to in-memory history (deduplicate consecutive duplicates),
+        // cap size to avoid runaway growth, and reset the navigation cursor
+        // so the next Up brings back the just-sent prompt.
+        if (_history.Count == 0 || _history[^1] != text)
+            _history.Add(text);
+        if (_history.Count > HistoryCap)
+            _history.RemoveRange(0, _history.Count - HistoryCap);
+        _historyIndex = -1;
+        _historyDraft = string.Empty;
+
+        // Clear the input box — deferred to the next dispatcher cycle so
+        // it lands AFTER the current Enter keystroke's TSF / IME composition
+        // commit has fully drained. Mutating the bound Text property
+        // synchronously inside the key-event message frame while WPF's
+        // TextStore is mid-`OnEndComposition` leaves TSF state inconsistent
+        // and trips a `MS.Internal.Invariant.FailFast` later — even after
+        // focus has moved to another control (pane) — taking the whole
+        // cmuxw.exe down with .NET Runtime Id=1025.
+        Application.Current?.Dispatcher.BeginInvoke(new Action(() => { Text = string.Empty; }));
+
+        // Stage 2: wait long enough for the receiver to finalize its
+        // paste-end / input-buffer state before delivering Enter as its
+        // own keystroke. ~40 ms is below human perception for a manual
+        // broadcast but well above the worst-case TUI render frame.
+        await Task.Delay(40).ConfigureAwait(true);
+
+        // Stage 3: deliver the submit keystroke as a separate write.
+        foreach (var session in sessions)
+        {
+            try { session.Write("\r"); }
+            catch { /* one bad session shouldn't block the others */ }
+        }
+    }
+
+    /// <summary>
+    /// True if Up would advance to an older history entry (caret-line
+    /// check is the view's job). Lets the view decide whether to Handle
+    /// the key without actually performing the mutation synchronously.
+    /// </summary>
+    public bool CanNavigateHistoryUp =>
+        _history.Count > 0
+        && (_historyIndex < 0 || _historyIndex + 1 < _history.Count);
+
+    /// <summary>
+    /// True if Down would step toward newer (or restore draft).
+    /// </summary>
+    public bool CanNavigateHistoryDown => _historyIndex >= 0;
+
+    /// <summary>
+    /// Step backward in submission history (older). Returns true if Text
+    /// changed (caller should reposition the caret). Saves the current
+    /// draft on the first navigation step so that stepping past the newest
+    /// entry restores what the user was typing.
+    /// </summary>
+    /// <remarks>
+    /// Must be invoked OUTSIDE a TextBox key event handler (post via
+    /// Dispatcher.BeginInvoke) — mutating the bound Text property while
+    /// WPF's TextStore holds the composition lock for the current key has
+    /// caused .NET Runtime FailFast crashes (TextStore.OnEndComposition
+    /// invariant violation) during Korean / IME input.
+    /// </remarks>
+    public bool TryNavigateHistoryUp()
+    {
+        if (_history.Count == 0) return false;
+
+        if (_historyIndex < 0)
+            _historyDraft = Text ?? string.Empty;
+
+        int newIndex = _historyIndex < 0 ? 0 : _historyIndex + 1;
+        if (newIndex >= _history.Count) return false;  // already at the oldest entry
+
+        _historyIndex = newIndex;
+        Text = _history[_history.Count - 1 - _historyIndex];
+        return true;
+    }
+
+    /// <summary>
+    /// Step forward in submission history (newer). Returns true if Text
+    /// changed. At the newest entry, one more press restores the draft
+    /// captured on history entry and exits navigation mode (matches the
+    /// readline / bash history-down behavior). Same IME-deferral caveat as
+    /// <see cref="TryNavigateHistoryUp"/>.
+    /// </summary>
+    public bool TryNavigateHistoryDown()
+    {
+        if (_historyIndex < 0) return false;  // not currently navigating; nothing to step toward
+
+        if (_historyIndex == 0)
+        {
+            _historyIndex = -1;
+            Text = _historyDraft;
+            return true;
+        }
+
+        _historyIndex--;
+        Text = _history[_history.Count - 1 - _historyIndex];
+        return true;
     }
 
     partial void OnScopeChanged(BroadcastScope value)
@@ -347,7 +495,10 @@ public partial class BroadcastInputViewModel : ObservableObject
         // pane: pid is nonzero when the ConPTY child runs locally inside
         // cmuxw; null/0 means daemon-backed (the actual child PID lives in
         // cmux-daemon.exe and we have to ask the daemon for the kind).
-        var snapshots = new List<(string paneId, int localPid)>();
+        // bufferText is captured for local panes only — it lets
+        // AgentDetector disambiguate "SSH carrying Claude" from "bare SSH"
+        // by looking at the rendered output for Claude TUI markers.
+        var snapshots = new List<(string paneId, int localPid, string? bufferText, string? announcedAgent)>();
         foreach (var surface in workspace.Surfaces)
         {
             foreach (var leaf in surface.RootNode.GetLeaves())
@@ -355,20 +506,41 @@ public partial class BroadcastInputViewModel : ObservableObject
                 if (string.IsNullOrEmpty(leaf.PaneId)) continue;
                 var session = surface.GetSession(leaf.PaneId);
                 if (session == null) continue;
-                snapshots.Add((leaf.PaneId, session.ProcessId ?? 0));
+
+                string? bufferText = null;
+                if ((session.ProcessId ?? 0) > 0)
+                {
+                    try
+                    {
+                        var snap = session.Buffer.CreateSnapshot(maxScrollbackLines: 500);
+                        bufferText = string.Join('\n',
+                            snap.ScrollbackLines.Concat(snap.ScreenLines));
+                    }
+                    catch { /* snapshot failure is non-fatal */ }
+                }
+
+                snapshots.Add((leaf.PaneId, session.ProcessId ?? 0, bufferText, session.AnnouncedAgent));
             }
         }
 
         Task.Run(async () =>
         {
-            foreach (var (paneId, localPid) in snapshots)
+            foreach (var (paneId, localPid, bufferText, announcedAgent) in snapshots)
             {
                 if (ct.IsCancellationRequested) return;
 
                 AgentDetector.PaneAgentKind kind;
                 if (localPid > 0)
                 {
-                    kind = AgentDetector.ClassifyPane(localPid);
+                    kind = AgentDetector.ClassifyPane(localPid, bufferText, announcedAgent);
+                }
+                else if (!string.IsNullOrEmpty(announcedAgent))
+                {
+                    // Daemon-backed pane that already got an OSC 1338 announce
+                    // forwarded back through the daemon → cmuxw event path
+                    // (or replayed via DaemonSessionInfo on reconnect). The
+                    // announce alone is enough — no need to RPC the daemon.
+                    kind = AgentDetector.ClassifyPane(0, null, announcedAgent);
                 }
                 else
                 {
@@ -485,11 +657,19 @@ public partial class BroadcastInputViewModel : ObservableObject
                             // Send and pick them up on the next.
                             var cached = _kindCache.GetValueOrDefault(
                                 leaf.PaneId, AgentDetector.PaneAgentKind.Unknown);
-                            if (cached == AgentDetector.PaneAgentKind.Unknown
-                                && session.ProcessId is int pid && pid > 0)
+                            if (cached == AgentDetector.PaneAgentKind.Unknown)
                             {
-                                cached = AgentDetector.ClassifyPane(pid);
-                                _kindCache[leaf.PaneId] = cached;
+                                // Take whatever signals are cheaply available
+                                // for a synchronous reclassify. The OSC 1338
+                                // announce (if any) is on the session object
+                                // itself and is authoritative when present.
+                                var pid = session.ProcessId ?? 0;
+                                var announce = session.AnnouncedAgent;
+                                if (pid > 0 || !string.IsNullOrEmpty(announce))
+                                {
+                                    cached = AgentDetector.ClassifyPane(pid, bufferSnapshot: null, announcedAgent: announce);
+                                    _kindCache[leaf.PaneId] = cached;
+                                }
                             }
 
                             bool match = Scope switch
